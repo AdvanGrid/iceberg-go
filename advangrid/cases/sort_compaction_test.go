@@ -32,20 +32,24 @@ func sortByGK(rows []lane.Row) {
 	})
 }
 
-// compactForOrder compacts every month partition of tbl in one rewrite.
+// compactForOrder compacts every month partition of tbl in one rewrite with
+// the sort strategy.
 func compactForOrder(ctx context.Context, t *testing.T, tbl *table.Table) *table.Table {
 	t.Helper()
 	tasks, err := tbl.Scan().PlanFiles(ctx)
 	require.NoError(t, err)
 	cfg := compaction.DefaultConfig()
 	cfg.MinInputFiles = 2
+	cfg.Strategy = table.SortStrategy
 	plan, err := cfg.PlanCompaction(tasks)
 	require.NoError(t, err)
 	groups := make([]table.CompactionTaskGroup, len(plan.Groups))
 	for i, g := range plan.Groups {
 		groups[i] = table.CompactionTaskGroup{PartitionKey: g.PartitionKey, Tasks: g.Tasks, TotalSizeBytes: g.TotalSizeBytes}
 	}
-	res, err := tbl.RewriteDataFiles(ctx, groups, table.RewriteDataFilesOptions{})
+	res, err := tbl.RewriteDataFiles(ctx, groups, table.RewriteDataFilesOptions{
+		GroupOptions: []table.CompactionGroupOption{table.WithCompactionStrategy(table.SortStrategy)},
+	})
 	require.NoError(t, err)
 
 	return res.Table

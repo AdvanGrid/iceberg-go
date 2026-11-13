@@ -85,6 +85,13 @@ type Config struct {
 	// into the snapshot walk + RewriteDataFilesOptions.ExtraDeleteFilesToRemove
 	// — see CollectDeadEqualityDeletesWithSpecs.
 	PreserveDeadEqualityDeletes bool
+
+	// Strategy is the rewrite strategy the plan is for. With
+	// [table.SortStrategy], planning fails with [table.ErrInvalidOperation]
+	// when a group has delete files, and [Analyze] also fails for a table
+	// without a sort order. Pass the same strategy to the executor with
+	// [table.WithCompactionStrategy]. Default: [table.BinPackStrategy].
+	Strategy table.CompactionStrategy
 }
 
 const (
@@ -260,6 +267,10 @@ func (cfg Config) PlanCompaction(tasks []table.FileScanTask) (Plan, error) {
 			for _, t := range bin {
 				group.TotalSizeBytes += t.File.FileSizeBytes()
 				group.DeleteFileCount += len(t.DeleteFiles) + len(t.EqualityDeleteFiles) + len(t.DeletionVectorFiles)
+			}
+			if cfg.Strategy == table.SortStrategy && group.DeleteFileCount > 0 {
+				return Plan{}, fmt.Errorf("%w: the sort strategy cannot rewrite partition %q, its files have %d delete files",
+					table.ErrInvalidOperation, key, group.DeleteFileCount)
 			}
 
 			estFiles := max(1, int((group.TotalSizeBytes+cfg.TargetFileSizeBytes-1)/cfg.TargetFileSizeBytes))
