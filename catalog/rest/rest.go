@@ -101,6 +101,7 @@ const (
 
 	keyViewEndpointsSupported = "view-endpoints-supported"
 	keySnapshotLoadingMode    = "snapshot-loading-mode"
+	keyPreferClientConfig     = "rest.prefer-client-config"
 )
 
 var (
@@ -732,6 +733,8 @@ func fromProps(props iceberg.Properties, o *options) error {
 			o.resource = v
 		case keyPrefix:
 			o.prefix = v
+		case keyPreferClientConfig:
+			o.preferClientConfig = strings.ToLower(v) == "true"
 		case keyTlsSkipVerify:
 			verify := strings.ToLower(v) == "true"
 			if o.tlsConfig == nil {
@@ -827,6 +830,9 @@ func toProps(o *options) iceberg.Properties {
 	}
 
 	setIf(keyPrefix, o.prefix)
+	if o.preferClientConfig {
+		props[keyPreferClientConfig] = "true"
+	}
 	if o.authUri != nil {
 		// Advertise the endpoint only under the portable oauth2-server-uri key.
 		// We canonicalize to this key everywhere else (fromProps precedence,
@@ -868,6 +874,10 @@ type Catalog struct {
 	// metrics-reporter-impl cannot select (or, via an unregistered name, break)
 	// a reporter the client never asked for.
 	reporterProps iceberg.Properties
+	// preferClientConfig makes the client-supplied properties win over the
+	// table config the server returns. Like reporterProps it is read before
+	// /v1/config is merged, so only the client can turn it on.
+	preferClientConfig bool
 	// metricsDispatcher POSTs scan/commit reports to the server's metrics
 	// endpoint on a bounded worker pool shared across this catalog's table
 	// reporters. It is nil unless the client opted in (reportMetricsEnabled, read
@@ -1008,6 +1018,7 @@ func (r *Catalog) init(ctx context.Context, ops *options, uri string) error {
 	// server's /v1/config defaults and overrides, so the metrics reporter is
 	// resolved from the client's choice alone (see the reporterProps field).
 	r.reporterProps = toProps(ops)
+	r.preferClientConfig = ops.preferClientConfig
 
 	if ops, err = r.fetchConfig(ctx, ops); err != nil {
 		return err
@@ -1534,14 +1545,29 @@ func (r *Catalog) CreateTable(ctx context.Context, identifier table.Identifier, 
 		ret.MetadataLoc = metaLoc
 	}
 
-	config := maps.Clone(r.props)
-	maps.Copy(config, ret.Metadata.Properties())
-	maps.Copy(config, ret.Config)
+	config := r.tableConfig(ret.Metadata.Properties(), ret.Config)
 	scanPlanningConfig := maps.Clone(config)
 	credsVended := len(ret.StorageCredentials) > 0
 	maps.Copy(config, resolveStorageCredentials(ret.StorageCredentials, ret.MetadataLoc))
 
 	return r.tableFromResponse(ctx, identifier, ret.Metadata, ret.MetadataLoc, config, scanPlanningConfig, credsVended)
+}
+
+// tableConfig merges the catalog properties, the table's metadata properties
+// and the table config the server returned, in that order of precedence.
+// With preferClientConfig the client-supplied properties win over the
+// server's table config.
+func (r *Catalog) tableConfig(metadataProps, serverConfig iceberg.Properties) iceberg.Properties {
+	config := maps.Clone(r.props)
+	maps.Copy(config, metadataProps)
+	for k, v := range serverConfig {
+		if _, ok := r.reporterProps[k]; ok && r.preferClientConfig {
+			continue
+		}
+		config[k] = v
+	}
+
+	return config
 }
 
 // commitStagedCreate performs the second phase of a staged table
@@ -1762,9 +1788,7 @@ func (r *Catalog) RegisterTable(ctx context.Context, identifier table.Identifier
 		return nil, err
 	}
 
-	config := maps.Clone(r.props)
-	maps.Copy(config, ret.Metadata.Properties())
-	maps.Copy(config, ret.Config)
+	config := r.tableConfig(ret.Metadata.Properties(), ret.Config)
 	scanPlanningConfig := maps.Clone(config)
 	credsVended := len(ret.StorageCredentials) > 0
 	maps.Copy(config, resolveStorageCredentials(ret.StorageCredentials, ret.MetadataLoc))
@@ -1807,9 +1831,7 @@ func (r *Catalog) loadTableWithMode(ctx context.Context, identifier table.Identi
 		return nil, err
 	}
 
-	config := maps.Clone(r.props)
-	maps.Copy(config, ret.Metadata.Properties())
-	maps.Copy(config, ret.Config)
+	config := r.tableConfig(ret.Metadata.Properties(), ret.Config)
 	scanPlanningConfig := maps.Clone(config)
 	credsVended := len(ret.StorageCredentials) > 0
 	maps.Copy(config, resolveStorageCredentials(ret.StorageCredentials, ret.MetadataLoc))

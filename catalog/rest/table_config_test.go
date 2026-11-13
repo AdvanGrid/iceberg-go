@@ -20,6 +20,7 @@ package rest_test
 import (
 	"context"
 	"fmt"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"sync/atomic"
@@ -27,7 +28,7 @@ import (
 
 	"github.com/apache/iceberg-go"
 	"github.com/apache/iceberg-go/catalog"
-	_ "github.com/apache/iceberg-go/catalog/rest"
+	"github.com/apache/iceberg-go/catalog/rest"
 	_ "github.com/apache/iceberg-go/io/gocloud/s3"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -65,11 +66,17 @@ func newTableConfigServer(t *testing.T, storageEndpoint string) *httptest.Server
 	return srv
 }
 
-func openTableObject(t *testing.T, props iceberg.Properties) {
-	ctx := context.Background()
-	cat, err := catalog.Load(ctx, "rest", props)
-	require.NoError(t, err)
+func storageProps(endpoint string) iceberg.Properties {
+	return iceberg.Properties{
+		"s3.endpoint":          endpoint,
+		"s3.region":            "us-east-1",
+		"s3.access-key-id":     "key",
+		"s3.secret-access-key": "secret",
+	}
+}
 
+func openTableObject(t *testing.T, cat catalog.Catalog) {
+	ctx := context.Background()
 	tbl, err := cat.LoadTable(ctx, catalog.ToIdentifier("ns", "tbl"))
 	require.NoError(t, err)
 
@@ -79,14 +86,42 @@ func openTableObject(t *testing.T, props iceberg.Properties) {
 }
 
 func TestLoadTableStorageEndpointPrecedence(t *testing.T) {
+	loadWithProps := func(extra iceberg.Properties) func(*testing.T, string, string) catalog.Catalog {
+		return func(t *testing.T, uri, endpoint string) catalog.Catalog {
+			props := storageProps(endpoint)
+			props["type"] = "rest"
+			props["uri"] = uri
+			maps.Copy(props, extra)
+			cat, err := catalog.Load(context.Background(), "rest", props)
+			require.NoError(t, err)
+
+			return cat
+		}
+	}
+
 	tests := []struct {
 		name             string
-		preferClient     bool
+		open             func(t *testing.T, uri, endpoint string) catalog.Catalog
 		wantClientStore  bool
 		wantCatalogStore bool
 	}{
-		{name: "table config wins by default", wantCatalogStore: true},
-		{name: "client properties win when preferred", preferClient: true, wantClientStore: true},
+		{name: "table config wins by default", open: loadWithProps(nil), wantCatalogStore: true},
+		{
+			name:            "client properties win with the property",
+			open:            loadWithProps(iceberg.Properties{"rest.prefer-client-config": "true"}),
+			wantClientStore: true,
+		},
+		{
+			name: "client properties win with the option",
+			open: func(t *testing.T, uri, endpoint string) catalog.Catalog {
+				cat, err := rest.NewCatalog(context.Background(), "rest", uri,
+					rest.WithAdditionalProps(storageProps(endpoint)), rest.WithPreferClientConfig())
+				require.NoError(t, err)
+
+				return cat
+			},
+			wantClientStore: true,
+		},
 	}
 
 	for _, tt := range tests {
@@ -95,18 +130,7 @@ func TestLoadTableStorageEndpointPrecedence(t *testing.T) {
 			catalogStore := newObjectStore(t)
 			srv := newTableConfigServer(t, catalogStore.srv.URL)
 
-			props := iceberg.Properties{
-				"type":                 "rest",
-				"uri":                  srv.URL,
-				"s3.endpoint":          clientStore.srv.URL,
-				"s3.region":            "us-east-1",
-				"s3.access-key-id":     "key",
-				"s3.secret-access-key": "secret",
-			}
-			if tt.preferClient {
-				props["rest.prefer-client-config"] = "true"
-			}
-			openTableObject(t, props)
+			openTableObject(t, tt.open(t, srv.URL, clientStore.srv.URL))
 
 			assert.Equal(t, tt.wantClientStore, clientStore.hits.Load() > 0, "client store hit")
 			assert.Equal(t, tt.wantCatalogStore, catalogStore.hits.Load() > 0, "catalog store hit")

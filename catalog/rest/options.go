@@ -159,6 +159,17 @@ func WithAdditionalProps(props iceberg.Properties) Option {
 	}
 }
 
+// WithPreferClientConfig makes the client-supplied properties win over the
+// table config the server returns when a table is loaded, created or
+// registered. Use it when the client reaches storage through a different
+// endpoint than the one the catalog advertises, for example a host-run client
+// overriding s3.endpoint. Equivalent to the rest.prefer-client-config property.
+func WithPreferClientConfig() Option {
+	return func(o *options) {
+		o.preferClientConfig = true
+	}
+}
+
 // WithCustomTransport replaces the internally configured http.Transport with the provided http.RoundTripper.
 // Certain options such as WithTLSConfig which modify the default http.Transport will no longer work since the entire transport is replaced.
 func WithCustomTransport(transport http.RoundTripper) Option {
@@ -196,6 +207,8 @@ type options struct {
 	transport         http.RoundTripper
 	transportFactory  TransportFactory
 	headers           map[string]string
+
+	preferClientConfig bool
 
 	oauthTLSConfig *tls.Config
 
