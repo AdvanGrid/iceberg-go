@@ -120,6 +120,75 @@ func (s *WriteRecordsTestSuite) TestBasicWrite() {
 	s.Contains(dataFiles[0].FilePath(), loc)
 }
 
+// TestCallerKeepsBatchOwnership verifies that WriteRecords follows the usual
+// Arrow contract: the batches it consumes stay valid after the write, and the
+// caller's own Release is the only one. The checked allocator in TearDownTest
+// catches both a release by WriteRecords and a leak.
+func (s *WriteRecordsTestSuite) TestCallerKeepsBatchOwnership() {
+	tests := []struct {
+		name        string
+		partitioned bool
+		opts        []table.WriteRecordOption
+	}{
+		{name: "unpartitioned"},
+		{name: "partitioned_fanout", partitioned: true},
+		{name: "partitioned_clustered", partitioned: true, opts: []table.WriteRecordOption{table.WithClusteredWrite()}},
+	}
+
+	for _, tt := range tests {
+		s.Run(tt.name, func() {
+			loc := filepath.ToSlash(s.T().TempDir())
+			iceSch := iceberg.NewSchema(1,
+				iceberg.NestedField{ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int32},
+				iceberg.NestedField{ID: 2, Name: "name", Type: iceberg.PrimitiveTypes.String},
+			)
+			spec := iceberg.NewPartitionSpec()
+			if tt.partitioned {
+				spec = iceberg.NewPartitionSpec(iceberg.PartitionField{
+					SourceIDs: []int{2}, FieldID: 1000, Name: "name", Transform: iceberg.IdentityTransform{},
+				})
+			}
+			meta, err := table.NewMetadata(iceSch, &spec, table.UnsortedSortOrder, loc, iceberg.Properties{})
+			s.Require().NoError(err)
+			tbl := table.New(
+				table.Identifier{"test", tt.name}, meta, filepath.Join(loc, "metadata", "v1.metadata.json"),
+				func(context.Context) (iceio.IO, error) { return iceio.LocalFS{}, nil }, nil,
+			)
+
+			schema := s.arrowSchema()
+			batches := make([]arrow.RecordBatch, 3)
+			for i := range batches {
+				batches[i] = s.buildRecords(schema, 10)
+			}
+			defer func() {
+				for _, b := range batches {
+					b.Release()
+				}
+			}()
+
+			records := func(yield func(arrow.RecordBatch, error) bool) {
+				for _, b := range batches {
+					if !yield(b, nil) {
+						return
+					}
+				}
+			}
+
+			var totalRows int64
+			for df, err := range table.WriteRecords(s.ctx, tbl, schema, records, tt.opts...) {
+				s.Require().NoError(err)
+				totalRows += df.Count()
+			}
+			s.Equal(int64(30), totalRows)
+
+			for _, b := range batches {
+				s.Require().EqualValues(2, b.NumCols(), "WriteRecords released a batch the caller owns")
+				s.Equal(int32(9), b.Column(0).(*array.Int32).Value(9))
+			}
+		})
+	}
+}
+
 func (s *WriteRecordsTestSuite) TestWriteRecordsResolvesProjJSONCRSFromTableProperties() {
 	const projjson = `{"type":"GeographicCRS","name":"Custom WGS 84"}`
 	loc := filepath.ToSlash(s.T().TempDir())

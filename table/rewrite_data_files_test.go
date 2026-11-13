@@ -28,6 +28,7 @@ import (
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
+	"github.com/apache/arrow-go/v18/arrow/compute"
 	"github.com/apache/arrow-go/v18/arrow/memory"
 	"github.com/apache/arrow-go/v18/parquet/file"
 	"github.com/apache/iceberg-go"
@@ -360,6 +361,41 @@ func TestExecuteCompactionGroup_TargetFileSizeForwarded(t *testing.T) {
 	require.NoError(t, err)
 	assert.Len(t, withDefault.NewDataFiles, 1,
 		"without the option, the same group consolidates into a single file")
+}
+
+// TestExecuteCompactionGroup_ReleasesScannedBatches verifies that compaction
+// releases the batches it reads from the group's files once they are written,
+// so no Arrow memory outlives the call.
+func TestExecuteCompactionGroup_ReleasesScannedBatches(t *testing.T) {
+	tbl := newRewriteTestTable(t)
+
+	arrowSc, err := table.SchemaToArrowSchema(tbl.Schema(), nil, false, false)
+	require.NoError(t, err)
+
+	for i := range 3 {
+		dataPath := tbl.Location() + fmt.Sprintf("/data/file-%d.parquet", i)
+		writeParquetFile(t, dataPath, arrowSc,
+			fmt.Sprintf(`[{"id": %d, "data": "row-%d"}]`, i+1, i+1))
+		tx := tbl.NewTransaction()
+		require.NoError(t, tx.AddFiles(t.Context(), []string{dataPath}, nil, false))
+		tbl, err = tx.Commit(t.Context())
+		require.NoError(t, err)
+	}
+
+	tasks, err := tbl.Scan().PlanFiles(t.Context())
+	require.NoError(t, err)
+
+	mem := memory.NewCheckedAllocator(memory.DefaultAllocator)
+	defer mem.AssertSize(t, 0)
+	ctx := compute.WithAllocator(t.Context(), mem)
+
+	result, err := table.ExecuteCompactionGroup(ctx, tbl, table.CompactionTaskGroup{
+		PartitionKey: "single",
+		Tasks:        tasks,
+	})
+	require.NoError(t, err)
+	require.Len(t, result.NewDataFiles, 1)
+	assert.EqualValues(t, 3, result.NewDataFiles[0].Count())
 }
 
 // TestExecuteCompactionGroup_ParquetRowGroupLimitForwarded verifies
