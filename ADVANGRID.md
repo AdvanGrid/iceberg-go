@@ -41,9 +41,19 @@ CI (`.github/workflows/advangrid.yml`) runs three jobs on pull requests and push
 | `integration`  | upstream's `make integration-setup` and `make integration-test` |
 | `differential` | `make advangrid-setup` and `make advangrid-test`           |
 
-Upstream's own workflows are disabled in this repository.
+Upstream's own workflows are disabled in this repository. The nightly scheduled run of `advangrid.yml` sets `LANE_NIGHTLY=1`, which runs the randomized test with more seeds and more steps.
 
 To run the upstream integration lane locally: `make integration-setup`, export the variables printed by `make integration-env`, then `make integration-test`.
+
+## The differential lane
+
+`make advangrid-setup` starts the services the lane needs from upstream's `internal/recipe` plus `advangrid/recipe/docker-compose.yml`: Garage v2.2.0, Lakekeeper v0.14.3 on Postgres, and a Spark oracle. Garage, Lakekeeper and the oracle share `spark-iceberg`'s network namespace, so the warehouse endpoint `http://localhost:3900` works for Lakekeeper, Spark and tests on the host. The script creates two warehouses: `lake`, and `split`, whose endpoint `http://spark-iceberg:3900` resolves only inside the stack. It also downloads the DuckDB v2.0.0 extensions and checks them against `advangrid/recipe/duckdb-extensions.sha256`.
+
+The oracle (`advangrid/recipe/oracle.py`) is one Spark session (Spark 3.5, Iceberg Java 1.8.1) behind `http://localhost:8899/sql`. It is the reference reader.
+
+`make advangrid-test` runs the Go module in `advangrid/`, which replaces `github.com/apache/iceberg-go` with the checkout. `advangrid/lane` holds the helpers, and `advangrid/cases` holds the cases. Every case compares a checksum read by iceberg-go, DuckDB and Spark: the row count, the exact sum of every integer and decimal column, and timestamps summed as epoch milliseconds.
+
+`make advangrid-down` removes the stack. On rootless podman, run the targets with `DOCKER_HOST` set to the podman socket and `PODMAN_COMPOSE_PROVIDER` set to a docker-compose v2 binary.
 
 ## Fixes and upstream candidates
 

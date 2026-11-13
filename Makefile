@@ -87,3 +87,19 @@ integration-hadoop:
 
 integration-hadoop-clean:
 	rm -rf /tmp/iceberg-hadoop-warehouse/*
+
+# AdvanGrid differential lane (advangrid/, see ADVANGRID.md)
+ADVANGRID_COMPOSE := docker compose -f internal/recipe/docker-compose.yml -f advangrid/recipe/docker-compose.yml
+
+advangrid-setup:
+	mkdir -p /tmp/iceberg-hadoop-warehouse
+	advangrid/recipe/setup.sh
+
+advangrid-test:
+	cd advangrid && go test -count=1 -timeout=60m ./...
+
+advangrid-down:
+	$(ADVANGRID_COMPOSE) down -v
+
+advangrid-logs:
+	$(ADVANGRID_COMPOSE) logs

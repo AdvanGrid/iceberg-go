@@ -1,0 +1,98 @@
+# Lakekeeper and Garage on top of upstream's internal/recipe. Garage, Lakekeeper
+# and the Spark oracle share spark-iceberg's network namespace, so the warehouse
+# endpoint http://localhost:3900 works the same for Lakekeeper, Spark and the
+# Go tests on the host. Paths are relative to internal/recipe, the first file.
+services:
+  spark-iceberg:
+    ports:
+      - 3900:3900
+      - 8282:8282
+      - 8899:8899
+
+  garage:
+    image: docker.io/dxflrs/garage:v2.2.0
+    container_name: lake-garage
+    network_mode: service:spark-iceberg
+    depends_on:
+      - spark-iceberg
+    entrypoint: ["/garage"]
+    command: ["server"]
+    environment:
+      GARAGE_RPC_SECRET: 2628aa6789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+      GARAGE_ADMIN_TOKEN: lane-admin
+    volumes:
+      - ../../advangrid/recipe/garage.toml:/etc/garage.toml:ro
+      - garage-data:/var/lib/garage
+
+  lake-postgres:
+    image: docker.io/library/postgres:18.1
+    container_name: lake-postgres
+    networks:
+      iceberg_net:
+    environment:
+      POSTGRES_PASSWORD: lane
+      POSTGRES_DB: lakekeeper
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 2s
+      retries: 60
+
+  lakekeeper-migrate:
+    image: quay.io/lakekeeper/catalog:v0.14.3
+    container_name: lake-lakekeeper-migrate
+    networks:
+      iceberg_net:
+    command: ["migrate"]
+    environment: &lakekeeper-env
+      LAKEKEEPER__PG_DATABASE_URL_READ: postgresql://postgres:lane@lake-postgres:5432/lakekeeper
+      LAKEKEEPER__PG_DATABASE_URL_WRITE: postgresql://postgres:lane@lake-postgres:5432/lakekeeper
+      LAKEKEEPER__PG_ENCRYPTION_KEY: lane-encryption-key-not-secret
+      LAKEKEEPER__AUTHZ_BACKEND: allowall
+      LAKEKEEPER__LISTEN_PORT: "8282"
+      LAKEKEEPER__METRICS_PORT: "9100"
+    depends_on:
+      lake-postgres:
+        condition: service_healthy
+    restart: "no"
+
+  lakekeeper:
+    image: quay.io/lakekeeper/catalog:v0.14.3
+    container_name: lake-lakekeeper
+    network_mode: service:spark-iceberg
+    command: ["serve"]
+    environment: *lakekeeper-env
+    depends_on:
+      spark-iceberg:
+        condition: service_started
+      garage:
+        condition: service_started
+      lakekeeper-migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "/home/nonroot/lakekeeper", "healthcheck"]
+      interval: 2s
+      retries: 60
+
+  spark-oracle:
+    image: ${SPARK_IMAGE:-pyiceberg-spark}
+    container_name: lake-spark-oracle
+    network_mode: service:spark-iceberg
+    depends_on:
+      - spark-iceberg
+      - lakekeeper
+    entrypoint: ["python", "/advangrid/oracle.py"]
+    environment:
+      AWS_REGION: us-east-1
+      SPARK_LOCAL_IP: 127.0.0.1
+      SPARK_LOCAL_HOSTNAME: localhost
+    volumes:
+      - ../../advangrid/recipe/oracle.py:/advangrid/oracle.py:ro
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8899/health')"]
+      interval: 5s
+      timeout: 5s
+      retries: 60
+      start_period: 30s
+
+volumes:
+  garage-data:
