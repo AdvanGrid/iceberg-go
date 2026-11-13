@@ -1,0 +1,51 @@
+name: AdvanGrid
+
+on:
+  push:
+    branches:
+      - advangrid
+    tags:
+      - 'v*-adv.*'
+  pull_request:
+    branches:
+      - advangrid
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - run: go test ./...
+
+  integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - run: make integration-setup
+      - name: Export integration environment
+        run: |
+          echo "AWS_S3_ENDPOINT=http://$(docker inspect -f '{{range.NetworkSettings.Networks}}{{.IPAddress}}{{end}}' object-store):9000" >> "$GITHUB_ENV"
+          echo "AWS_REGION=us-east-1" >> "$GITHUB_ENV"
+          echo "SPARK_CONTAINER_ID=$(docker ps -qf 'name=spark-iceberg')" >> "$GITHUB_ENV"
+          echo "DOCKER_API_VERSION=$(docker version -f '{{.Server.APIVersion}}')" >> "$GITHUB_ENV"
+      - run: make integration-test
+      - name: Show service logs
+        if: failure()
+        run: make integration-logs
