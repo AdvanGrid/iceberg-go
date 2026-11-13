@@ -68,9 +68,8 @@ type producerImpl interface {
 // snapshot may not reference: merged manifests OCC retries orphan, and for
 // merge-append the new-files manifest a merge folded into a larger one.
 type supersededAccumulator interface {
-	// supersededManifests returns paths of merged manifests to delete once the
-	// commit resolves. When committed is false the commit never landed, so the
-	// final attempt's manifests are orphaned too and are included.
+	// supersededManifests returns paths of manifests to delete once the
+	// commit resolves. committed is false when the commit never landed.
 	supersededManifests(committed bool) []string
 }
 
@@ -659,12 +658,13 @@ type mergeAppendFiles struct {
 	mergeEnabled     bool
 	mergeConcurrency int
 
-	// written holds every manifest this producer wrote across OCC attempts:
-	// the new-files manifest and the merged manifests of each pass.
+	// written holds every manifest this producer wrote across passes: the
+	// new-files manifests and the merged manifests of each pass.
 	written map[string]struct{}
-	// firstPass and lastPass are the manifests this producer wrote that the
-	// first and the latest pass reference.
-	firstPass, lastPass map[string]struct{}
+	// firstWritten is written after the first pass. firstOutput and
+	// lastOutput are the written manifests the first and the latest pass
+	// reference.
+	firstWritten, firstOutput, lastOutput map[string]struct{}
 }
 
 func newMergeAppendFilesProducer(op Operation, txn *Transaction, fs iceio.WriteFileIO, commitUUID *uuid.UUID, snapshotProps iceberg.Properties) *snapshotProducer {
@@ -712,11 +712,11 @@ func (m *mergeAppendFiles) processManifests(manifests []iceberg.ManifestFile) ([
 // record notes the manifests this producer wrote for one pass: its own
 // inputs (the new-files manifests) and its merged outputs.
 func (m *mergeAppendFiles) record(input, output []iceberg.ManifestFile) {
+	own := func(mf iceberg.ManifestFile) bool { return mf.SnapshotID() == m.base.snapshotID }
 	if m.written == nil {
 		m.written = map[string]struct{}{}
 	}
-	own := func(mf iceberg.ManifestFile) bool { return mf.SnapshotID() == m.base.snapshotID }
-	for _, mf := range slices.Concat(input, output) {
+	for _, mf := range input {
 		if own(mf) {
 			m.written[mf.FilePath()] = struct{}{}
 		}
@@ -725,26 +725,28 @@ func (m *mergeAppendFiles) record(input, output []iceberg.ManifestFile) {
 	referenced := map[string]struct{}{}
 	for _, mf := range output {
 		if own(mf) {
+			m.written[mf.FilePath()] = struct{}{}
 			referenced[mf.FilePath()] = struct{}{}
 		}
 	}
-	if m.firstPass == nil {
-		// A failed commit leaves the transaction retriable with its first
-		// pass, so the first pass's inputs stay too.
-		m.firstPass = maps.Clone(m.written)
+	m.lastOutput = referenced
+	if m.firstWritten == nil {
+		m.firstWritten = maps.Clone(m.written)
+		m.firstOutput = referenced
 	}
-	m.lastPass = referenced
 }
 
 // supersededManifests returns the manifests this producer wrote that the
-// committed snapshot does not reference: the new-files manifest once a merge
-// folded it into a larger one, and merged manifests of superseded OCC
-// attempts. When the commit never landed, only manifests written after the
-// first pass are returned, since the transaction may still commit it.
+// committed snapshot does not reference, such as the new-files manifest a
+// merge folded into a larger one. The committed snapshot is the first pass's
+// or the latest pass's, so on success the outputs of both are kept. When the
+// commit never landed the transaction may commit its first pass again, so
+// everything the first pass wrote is kept.
 func (m *mergeAppendFiles) supersededManifests(committed bool) []string {
-	keep := m.firstPass
+	keep := m.firstWritten
 	if committed {
-		keep = m.lastPass
+		keep = maps.Clone(m.firstOutput)
+		maps.Copy(keep, m.lastOutput)
 	}
 
 	var paths []string
