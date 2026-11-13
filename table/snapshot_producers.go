@@ -64,8 +64,9 @@ type producerImpl interface {
 	needsValidation() bool
 }
 
-// supersededAccumulator marks a producer that writes merged manifests OCC
-// retries orphan. Only rewrite implements it.
+// supersededAccumulator marks a producer that writes manifests the committed
+// snapshot may not reference: merged manifests OCC retries orphan, and for
+// merge-append the new-files manifest a merge folded into a larger one.
 type supersededAccumulator interface {
 	// supersededManifests returns paths of merged manifests to delete once the
 	// commit resolves. When committed is false the commit never landed, so the
@@ -657,6 +658,13 @@ type mergeAppendFiles struct {
 	minCountToMerge  int
 	mergeEnabled     bool
 	mergeConcurrency int
+
+	// written holds every manifest this producer wrote across OCC attempts:
+	// the new-files manifest and the merged manifests of each pass.
+	written map[string]struct{}
+	// firstPass and lastPass are the manifests this producer wrote that the
+	// first and the latest pass reference.
+	firstPass, lastPass map[string]struct{}
 }
 
 func newMergeAppendFilesProducer(op Operation, txn *Transaction, fs iceio.WriteFileIO, commitUUID *uuid.UUID, snapshotProps iceberg.Properties) *snapshotProducer {
@@ -695,8 +703,58 @@ func (m *mergeAppendFiles) processManifests(manifests []iceberg.ManifestFile) ([
 	if err != nil {
 		return nil, err
 	}
+	result = append(result, unmergedDeleteManifests...)
+	m.record(manifests, result)
 
-	return append(result, unmergedDeleteManifests...), nil
+	return result, nil
+}
+
+// record notes the manifests this producer wrote for one pass: its own
+// inputs (the new-files manifests) and its merged outputs.
+func (m *mergeAppendFiles) record(input, output []iceberg.ManifestFile) {
+	if m.written == nil {
+		m.written = map[string]struct{}{}
+	}
+	own := func(mf iceberg.ManifestFile) bool { return mf.SnapshotID() == m.base.snapshotID }
+	for _, mf := range slices.Concat(input, output) {
+		if own(mf) {
+			m.written[mf.FilePath()] = struct{}{}
+		}
+	}
+
+	referenced := map[string]struct{}{}
+	for _, mf := range output {
+		if own(mf) {
+			referenced[mf.FilePath()] = struct{}{}
+		}
+	}
+	if m.firstPass == nil {
+		// A failed commit leaves the transaction retriable with its first
+		// pass, so the first pass's inputs stay too.
+		m.firstPass = maps.Clone(m.written)
+	}
+	m.lastPass = referenced
+}
+
+// supersededManifests returns the manifests this producer wrote that the
+// committed snapshot does not reference: the new-files manifest once a merge
+// folded it into a larger one, and merged manifests of superseded OCC
+// attempts. When the commit never landed, only manifests written after the
+// first pass are returned, since the transaction may still commit it.
+func (m *mergeAppendFiles) supersededManifests(committed bool) []string {
+	keep := m.firstPass
+	if committed {
+		keep = m.lastPass
+	}
+
+	var paths []string
+	for path := range m.written {
+		if _, ok := keep[path]; !ok {
+			paths = append(paths, path)
+		}
+	}
+
+	return paths
 }
 
 func (m *mergeAppendFiles) needsValidation() bool { return false }
@@ -1749,8 +1807,9 @@ func (sp *snapshotProducer) commitManifests(newManifests, addedContent []iceberg
 	addSnap := NewAddSnapshotUpdate(&snapshot)
 	addSnap.ownManifests = addedContent
 	addSnap.rebuildManifestList = rebuildFn
-	// Hold the producer so doCommit can read the manifests orphaned by OCC
-	// retries and clean them up. Only rewrite producers implement this.
+	// Hold the producer so doCommit can read the manifests the committed
+	// snapshot does not reference and clean them up. Rewrite and merge-append
+	// producers implement this.
 	if acc, ok := sp.producerImpl.(supersededAccumulator); ok {
 		addSnap.supersededSource = acc
 	}
