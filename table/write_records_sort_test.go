@@ -136,8 +136,9 @@ func (s *WriteRecordsSortTestSuite) TestPartitionedTableSortedPerFile() {
 	}
 
 	for _, df := range dataFiles {
-		// Per-batch sorting only, so no per-file sort order claim.
-		s.Nil(df.SortOrderID(), "data file must not claim a sort order id")
+		// One batch per file, sorted by the writer, so the file is in order.
+		s.Require().NotNil(df.SortOrderID(), "data file in order must claim the sort order id")
+		s.Equal(sortOrder.OrderID(), *df.SortOrderID())
 
 		ids, cats := readIDsAndCategories(s.T(), df.FilePath())
 		s.Require().NotEmpty(cats, "file should have at least one row")

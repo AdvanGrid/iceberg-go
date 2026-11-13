@@ -164,6 +164,17 @@ func TestExecuteCompactionGroup_SortStrategyMergesSortedFiles(t *testing.T) {
 
 	assert.Equal(t, sequence(1, 18), compactedIDs(t, result))
 	assert.Len(t, result.OldDataFiles, 4)
+	requireSortOrderID(t, result, tbl.SortOrder().OrderID())
+}
+
+func requireSortOrderID(t *testing.T, result table.CompactionGroupResult, want int) {
+	t.Helper()
+
+	require.NotEmpty(t, result.NewDataFiles)
+	for _, df := range result.NewDataFiles {
+		require.NotNil(t, df.SortOrderID(), df.FilePath())
+		assert.Equal(t, want, *df.SortOrderID(), df.FilePath())
+	}
 }
 
 func TestExecuteCompactionGroup_SortStrategySortsOutOfOrderFile(t *testing.T) {
@@ -180,6 +191,7 @@ func TestExecuteCompactionGroup_SortStrategySortsOutOfOrderFile(t *testing.T) {
 	require.NoError(t, err)
 
 	assert.Equal(t, sequence(1, 10), compactedIDs(t, result))
+	requireSortOrderID(t, result, tbl.SortOrder().OrderID())
 }
 
 func TestExecuteCompactionGroup_SortStrategyRefusesUnsortedTable(t *testing.T) {
