@@ -29,6 +29,7 @@ import (
 	"runtime"
 	"slices"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -3174,6 +3175,9 @@ func (t *Transaction) makePositionDeleteRecordsForFilter(ctx context.Context, fs
 		return nil, err
 	}
 
+	// The spec requires position delete files to be sorted by (file_path,
+	// pos). The records below are yielded in task order, and positions
+	// ascend within a task, so ordering the tasks by path is sufficient.
 	tasks := make([]FileScanTask, 0, len(files))
 	for _, f := range files {
 		tasks = append(tasks, FileScanTask{
@@ -3182,6 +3186,9 @@ func (t *Transaction) makePositionDeleteRecordsForFilter(ctx context.Context, fs
 			Length: f.FileSizeBytes(),
 		})
 	}
+	slices.SortFunc(tasks, func(a, b FileScanTask) int {
+		return strings.Compare(a.File.FilePath(), b.File.FilePath())
+	})
 
 	boundFilter, err := iceberg.BindExpr(meta.CurrentSchema(), filter, caseSensitive)
 	if err != nil {
