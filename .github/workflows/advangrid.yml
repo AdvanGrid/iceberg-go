@@ -9,6 +9,9 @@ on:
   pull_request:
     branches:
       - advangrid
+  schedule:
+    - cron: '23 2 * * *'
+  workflow_dispatch:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref || github.sha }}
@@ -49,3 +52,21 @@ jobs:
       - name: Show service logs
         if: failure()
         run: make integration-logs
+
+  differential:
+    runs-on: ubuntu-latest
+    env:
+      LANE_NIGHTLY: ${{ github.event_name == 'schedule' && '1' || '' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: advangrid/go.mod
+          cache-dependency-path: advangrid/go.sum
+      - run: make advangrid-setup
+      - run: make advangrid-test
+      - name: Show service logs
+        if: failure()
+        run: make advangrid-logs
