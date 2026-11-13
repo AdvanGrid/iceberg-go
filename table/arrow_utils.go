@@ -2267,9 +2267,11 @@ func positionDeleteRecordsToDataFiles(ctx context.Context, rootLocation string, 
 	}
 
 	partitionWriter := newPositionDeletePartitionedFanoutWriter(latestMetadata, partitionContextByFilePath, args.itr, factory)
-	workers := config.EnvConfig.MaxWorkers
 
-	return partitionWriter.Write(ctx, workers)
+	// One routing worker keeps each partition's batches in input order, so
+	// the sorted input stays sorted in every delete file. Routing is cheap;
+	// the rolling writers still write partitions concurrently.
+	return partitionWriter.Write(ctx, 1)
 }
 
 // positionDeleteRecordsToDataFilesDV produces deletion-vector Puffin output
