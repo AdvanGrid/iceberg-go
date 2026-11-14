@@ -4,8 +4,6 @@ import (
 	"fmt"
 	"math/big"
 	"strings"
-
-	"github.com/apache/iceberg-go/table"
 )
 
 // SQLValues renders rows as a SQL VALUES list in the column order of Schema,
@@ -19,7 +17,3 @@ func SQLValues(rows []Row) string {
 
 	return "VALUES " + strings.Join(values, ", ")
 }
-
-// QualifiedName is the table's namespace-qualified name as engines attached to
-// the lane's catalog address it.
-func QualifiedName(tbl *table.Table) string { return tableName(tbl) }

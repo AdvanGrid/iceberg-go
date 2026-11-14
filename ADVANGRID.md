@@ -55,6 +55,17 @@ The oracle (`advangrid/recipe/oracle.py`) is one Spark session (Spark 3.5, Icebe
 
 `make advangrid-down` removes the stack. On rootless podman, run the targets with `DOCKER_HOST` set to the podman socket and `PODMAN_COMPOSE_PROVIDER` set to a docker-compose v2 binary.
 
+## Full-size run
+
+`advangrid/cases/fullsize_test.go` (build tags `fullsize,duckdb_arrow`, so CI never builds it) runs the archived 240M-row `gridlink_line` table from AdvanGrid's lake spike. It covers backfill by year in declared order, a daily overwrite, sort compaction, manifest rewrite, expiry and orphan removal. After every step iceberg-go, DuckDB and Spark must read the same checksum. Count and `sum(id)` must also equal the archive's own record, and files must have no order breaks. It runs on the engineer's workstation, against the lane stack:
+
+```
+cd advangrid && go test -c -tags fullsize,duckdb_arrow -o /tmp/cases.test ./cases/
+cd cases && LANE_FULLSIZE_DIR=<archive>/parquet/gridlink_line /tmp/cases.test -test.run '^TestFullSize$' -test.v -test.timeout 24h
+```
+
+On rootless podman, run the binary inside `spark-iceberg`'s network namespace (`podman unshare nsenter -t $(podman inspect -f '{{.State.Pid}}' spark-iceberg) -n ...`). Through the rootless port forwarding, long scans of this table had reads cut mid-body. The last passing run took 2h15m: backfill 53 min, then about 16 min per step, mostly the three checksums.
+
 ## Fixes and upstream candidates
 
 PR numbers refer to this repository. Every row's PR was red on its tests-only commit and green after the fix. Whether to propose a fix upstream is decided by a person. Known limits that are not fixed here: AdvanGrid/advangrid#2654 (each commit retry re-reads every manifest, so an overwrite can starve under steady contention).

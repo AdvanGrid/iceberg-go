@@ -90,13 +90,18 @@ func TableName(t testing.TB) string {
 func Ident(name string) table.Identifier { return catalog.ToIdentifier(Namespace, name) }
 
 // CreateTable creates a fresh table and drops it, with its files, when the
-// test ends.
+// test passes. A failed test keeps its table for inspection.
 func (l *Lake) CreateTable(t testing.TB, sc *iceberg.Schema, opts ...catalog.CreateTableOpt) *table.Table {
 	t.Helper()
 	name := TableName(t)
 	tbl, err := l.Catalog.CreateTable(context.Background(), Ident(name), sc, opts...)
 	require.NoError(t, err, "create %s", name)
 	t.Cleanup(func() {
+		if t.Failed() {
+			t.Logf("kept table %s.%s for inspection", Namespace, name)
+
+			return
+		}
 		_ = l.Catalog.DropTable(context.Background(), Ident(name))
 	})
 
@@ -126,7 +131,9 @@ func SetDeleteMode(t testing.TB, tbl *table.Table, mode string) *table.Table {
 // DeleteModes are the delete modes every case runs under.
 var DeleteModes = []string{table.WriteModeCopyOnWrite, table.WriteModeMergeOnRead}
 
-func tableName(tbl *table.Table) string {
+// QualifiedName is the table's namespace and name, as DuckDB's lk and
+// Spark's lake catalogs name it.
+func QualifiedName(tbl *table.Table) string {
 	id := tbl.Identifier()
 
 	return fmt.Sprintf("%s.%s", id[len(id)-2], id[len(id)-1])
