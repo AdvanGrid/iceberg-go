@@ -55,8 +55,6 @@ jobs:
 
   differential:
     runs-on: ubuntu-latest
-    env:
-      LANE_NIGHTLY: ${{ github.event_name == 'schedule' && '1' || '' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -67,6 +65,30 @@ jobs:
           cache-dependency-path: advangrid/go.sum
       - run: make advangrid-setup
       - run: make advangrid-test
+      - name: Show service logs
+        if: failure()
+        run: make advangrid-logs
+
+  nightly:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7]
+    env:
+      LANE_SHARD: ${{ matrix.shard }}/8
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: advangrid/go.mod
+          cache-dependency-path: advangrid/go.sum
+      - run: make advangrid-setup
+      - run: make advangrid-nightly
       - name: Show service logs
         if: failure()
         run: make advangrid-logs
