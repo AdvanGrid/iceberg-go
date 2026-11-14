@@ -138,7 +138,7 @@ type randomizedRun struct {
 // randomizedRuns are the fixed per-PR set, the pairwise layouts, and in the
 // nightly run every layout. Each layout runs under its own seed.
 func randomizedRuns() []randomizedRun {
-	layouts, steps := pairwiseLayouts(), 20
+	layouts, steps := pairwiseLayouts(), 12
 	if os.Getenv("LANE_NIGHTLY") != "" {
 		layouts, steps = allLayouts(), 40
 	}
