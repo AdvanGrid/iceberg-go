@@ -28,23 +28,18 @@ import (
 )
 
 // TestPositionDeltaWriter_BuildUnifiedIterator_AbortNoDoubleRelease verifies
-// that buildUnifiedIterator does not release batches it has already yielded
-// when the consumer aborts mid-stream.
-//
-// The releasing wrapper inside [WriteRecords] (write_records.go) owns the
-// release on both the success and the early-stop paths. If the producer also
-// releases on !yield, refcount would go negative — undefined behavior in
-// Arrow that happy-path tests miss because no IO error ever fires the abort
-// branch. This test simulates that wrapper contract directly on both the
-// reinsert path and the insert (enriched) path.
+// that buildUnifiedIterator keeps ownership of what it yields when the
+// consumer aborts mid-stream: the consumer releases nothing, the iterator
+// releases the enriched insert batches it built, and the staged batches stay
+// owned by the writer.
 func TestPositionDeltaWriter_BuildUnifiedIterator_AbortNoDoubleRelease(t *testing.T) {
 	cases := []struct {
 		name         string
 		numReinserts int
 		numInserts   int
-		// abortAfter yields are consumed and released by the test, then the
-		// loop breaks — triggering the producer's !yield branch on whichever
-		// phase the next yield would have come from.
+		// abortAfter yields are consumed by the test, then the loop breaks,
+		// triggering the producer's !yield branch on whichever phase the next
+		// yield would have come from.
 		abortAfter int
 		abortPhase string
 	}{
@@ -85,7 +80,7 @@ func TestPositionDeltaWriter_BuildUnifiedIterator_AbortNoDoubleRelease(t *testin
 			count := 0
 			for rec, err := range records {
 				require.NoError(t, err)
-				rec.Release()
+				require.Positive(t, rec.NumCols())
 				count++
 				if count >= tc.abortAfter {
 					break

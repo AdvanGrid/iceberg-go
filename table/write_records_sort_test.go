@@ -114,6 +114,7 @@ func (s *WriteRecordsSortTestSuite) TestPartitionedTableSortedPerFile() {
 	}
 	rec := bldr.NewRecordBatch()
 	bldr.Release()
+	defer rec.Release()
 
 	records := func(yield func(arrow.RecordBatch, error) bool) {
 		yield(rec, nil)
@@ -196,6 +197,8 @@ func (s *WriteRecordsSortTestSuite) TestUnpartitionedTableMultipleBatchesEachSor
 	// Interleaved ranges, so per-batch and global sort give different results.
 	batch1 := makeBatch([]int32{5, 3, 1})
 	batch2 := makeBatch([]int32{4, 2, 0})
+	defer batch1.Release()
+	defer batch2.Release()
 	records := func(yield func(arrow.RecordBatch, error) bool) {
 		if !yield(batch1, nil) {
 			return
