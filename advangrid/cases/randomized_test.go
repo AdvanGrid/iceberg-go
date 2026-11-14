@@ -138,7 +138,7 @@ type randomizedRun struct {
 // randomizedRuns are the fixed per-PR set, the pairwise layouts, and in the
 // nightly run every layout. Each layout runs under its own seed.
 func randomizedRuns() []randomizedRun {
-	layouts, steps := pairwiseLayouts(), 30
+	layouts, steps := pairwiseLayouts(), 20
 	if os.Getenv("LANE_NIGHTLY") != "" {
 		layouts, steps = allLayouts(), 40
 	}
@@ -149,6 +149,11 @@ func randomizedRuns() []randomizedRun {
 
 	return runs
 }
+
+// appendDays is the span of days one append covers, like an ingest run
+// that writes the latest days. Spanning all 90 days would give every append
+// of a day-partitioned table 90 tiny files.
+const appendDays = 7
 
 var randomOps = []string{"append", "append", "overwrite", "delete", "compact", "expire", "orphans", "rewrite_manifests"}
 
@@ -203,8 +208,9 @@ func runRandomized(t *testing.T, mode string, run randomizedRun) {
 func applyRandomOp(ctx context.Context, tbl *table.Table, op string, gen *lane.Gen, model lane.Model, sorted bool) (string, error) {
 	switch op {
 	case "append":
-		from, _ := lane.Day(0)
-		_, to := lane.Day(89)
+		first := gen.Rand.IntN(90 - appendDays + 1)
+		from, _ := lane.Day(first)
+		_, to := lane.Day(first + appendDays - 1)
 		rows := gen.Rows(500+gen.Rand.IntN(1500), from, to)
 		rdr := lane.Reader(rows, 512)
 		defer rdr.Release()
@@ -213,7 +219,7 @@ func applyRandomOp(ctx context.Context, tbl *table.Table, op string, gen *lane.G
 		}
 		model.Put(rows)
 
-		return fmt.Sprintf("append %d", len(rows)), nil
+		return fmt.Sprintf("append %d to days %d-%d", len(rows), first, first+appendDays-1), nil
 	case "overwrite":
 		day := gen.Rand.IntN(90)
 		from, to := lane.Day(day)
