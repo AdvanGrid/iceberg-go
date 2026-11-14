@@ -231,6 +231,40 @@ type compactionGroupConfig struct {
 	arrowBatchSize        int
 	recordBatchBufferSize int
 	parquetRowGroupLimit  int
+	strategy              CompactionStrategy
+}
+
+// CompactionStrategy selects how [ExecuteCompactionGroup] rewrites the rows
+// of a group.
+type CompactionStrategy int
+
+const (
+	// BinPackStrategy writes the group's rows in task order. It is the
+	// default.
+	BinPackStrategy CompactionStrategy = iota
+
+	// SortStrategy writes the group's rows in the table's sort order,
+	// like Java's SortStrategy. Each file is read at the snapshot the
+	// group was planned on and the files are merged by the sort order:
+	// a file already in order is streamed, and a file that is not is
+	// sorted in memory first. Memory therefore holds one batch per
+	// file in order plus every file out of order, which the planner's
+	// target group size bounds. The rows are compared by the source
+	// columns of the sort order, so every sort field but the last must
+	// use the identity transform and the last must preserve order.
+	//
+	// The strategy refuses tables without a sort order and groups with
+	// delete files, returning [ErrInvalidOperation]; use
+	// [BinPackStrategy] for those.
+	SortStrategy
+)
+
+// WithCompactionStrategy selects the rewrite strategy. The default is
+// [BinPackStrategy].
+func WithCompactionStrategy(strategy CompactionStrategy) CompactionGroupOption {
+	return func(c *compactionGroupConfig) {
+		c.strategy = strategy
+	}
 }
 
 // WithCompactionTargetFileSize sets the size target for output files
@@ -423,9 +457,10 @@ func (t *Transaction) RewriteDataFiles(ctx context.Context, groups []CompactionT
 // In-process callers should prefer [Transaction.RewriteDataFiles],
 // which drives this and the commit step in one call.
 //
-// Tunables are exposed via [CompactionGroupOption]. The clustered
-// write path is always used (a compaction group is single-partition
-// by construction so its read stream is trivially clustered).
+// Tunables are exposed via [CompactionGroupOption], including the
+// rewrite strategy ([WithCompactionStrategy]). The clustered write
+// path is always used (a compaction group is single-partition by
+// construction so its read stream is trivially clustered).
 func ExecuteCompactionGroup(ctx context.Context, tbl *Table, group CompactionTaskGroup, opts ...CompactionGroupOption) (CompactionGroupResult, error) {
 	if len(group.Tasks) == 0 {
 		return CompactionGroupResult{PartitionKey: group.PartitionKey}, nil
@@ -476,7 +511,20 @@ func ExecuteCompactionGroup(ctx context.Context, tbl *Table, group CompactionTas
 		}
 	}
 
-	arrowSchema, records, err := tbl.Scan(scanOpts...).ReadTasks(ctx, group.Tasks)
+	var (
+		arrowSchema *arrow.Schema
+		records     iter.Seq2[arrow.RecordBatch, error]
+		err         error
+	)
+	if cfg.strategy == SortStrategy {
+		batchRows := cfg.arrowBatchSize
+		if batchRows <= 0 {
+			batchRows = tbl.Properties().GetInt(ParquetBatchSizeKey, ParquetBatchSizeDefault)
+		}
+		arrowSchema, records, err = sortMergeRecords(ctx, tbl, group.Tasks, scanOpts, batchRows)
+	} else {
+		arrowSchema, records, err = tbl.Scan(scanOpts...).ReadTasks(ctx, group.Tasks)
+	}
 	if err != nil {
 		return CompactionGroupResult{}, fmt.Errorf("read tasks for compaction group %q: %w", group.PartitionKey, err)
 	}

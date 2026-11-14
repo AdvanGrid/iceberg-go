@@ -124,7 +124,7 @@ func SetDeleteMode(t testing.TB, tbl *table.Table, mode string) *table.Table {
 }
 
 // DeleteModes are the delete modes every case runs under.
-var DeleteModes = []string{table.WriteModeCopyOnWrite}
+var DeleteModes = []string{table.WriteModeCopyOnWrite, table.WriteModeMergeOnRead}
 
 func tableName(tbl *table.Table) string {
 	id := tbl.Identifier()
