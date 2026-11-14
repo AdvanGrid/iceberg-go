@@ -68,18 +68,23 @@ On rootless podman, run the binary inside `spark-iceberg`'s network namespace (`
 
 ## Fixes and upstream candidates
 
-PR numbers refer to this repository. Every row's PR was red on its tests-only commit and green after the fix. Whether to propose a fix upstream is decided by a person. Known limits that are not fixed here: AdvanGrid/advangrid#2654 (each commit retry re-reads every manifest, so an overwrite can starve under steady contention).
+PR numbers refer to this repository. Every row's PR was red on its tests-only commit and green after the fix. Whether to propose a fix upstream is decided by a person. Known limits that are not fixed here:
+
+- AdvanGrid/advangrid#2654: each commit retry re-reads every manifest, so an overwrite can starve under steady contention.
+- The sort comparer (#7, #10) places NaN by the sort direction, as the Iceberg spec says, while Arrow's sort places it by the null order. A float sort key with NaN can make a sorted file fail the order check (it is then sorted in memory) or end up slightly out of order around NaN. No rows are lost.
+- A merge append whose commit lands on a retry keeps the first attempt's merged manifests (#9); orphan removal deletes them.
 
 Behaviour changes for callers:
 
 - `WriteRecords` no longer releases the batches it consumes (finding 7). Code that retained batches before yielding them, as the old doc said, must stop retaining them.
 - Any partition writer error now fails the whole write, including a cancelled context (#14).
+- `rest.prefer-client-config` (#4) makes client properties win over the per-table `config` only. Table metadata properties, `/v1/config` overrides and vended storage credentials still apply after it.
 - Finding 1: Spark (Iceberg Java 1.8.1) reads unsorted position delete files correctly. The spike's misread came from Trino 484's own reader, so the case checks the files' order with DuckDB.
 
 | Finding | Fix | Unit test | Differential case | Upstream status |
 | ------- | --- | --------- | ----------------- | --------------- |
 | 1. Position delete files not sorted by `(file_path, pos)` | #6: scan tasks sorted by path, one routing worker in the delete fanout | `table/pos_delete_order_test.go` `TestMergeOnReadDeleteWritesSortedPositionDeletes` | `advangrid/cases/posdelete_order_test.go` `TestPositionDeletesAcrossFilesAreSorted` | Not proposed |
-| 2. Copy-on-write rewrite drops existing merge-on-read deletes | #5: rewrite plans and applies the file's positional, equality and DV deletes | `table/cow_rewrite_deletes_test.go` `TestCopyOnWriteRewriteKeepsMergeOnReadDeletes` | `advangrid/cases/cow_keeps_deletes_test.go` `TestOverwriteKeepsMergeOnReadDeletes` | Not proposed |
+| 2. Copy-on-write rewrite drops existing merge-on-read deletes | #5 and #22: rewrite plans the file's positional, equality and DV deletes without the row filter and applies them | `table/cow_rewrite_deletes_test.go` `TestCopyOnWriteRewriteKeepsMergeOnReadDeletes`, `TestCopyOnWriteRewriteKeepsPrunableEqualityDeletes` | `advangrid/cases/cow_keeps_deletes_test.go` `TestOverwriteKeepsMergeOnReadDeletes`, `TestOverwriteKeepsEqualityDeletes` | Not proposed |
 | 3. Bin-pack compaction loses the declared sort order | #7: `table.SortStrategy`, a streaming k-way merge by the sort order | `table/rewrite_data_files_sort_test.go`, `table/sort_merge_internal_test.go`, `table/compaction/sort_strategy_test.go` | `advangrid/cases/sort_compaction_test.go` `TestSortCompactionKeepsOrder` | Not proposed |
 | 4. Fanout writer reorders a partition's batches | #8: workers add a batch's partitions in input order | `table/partitioned_fanout_writer_order_test.go` `TestAppendKeepsBatchOrderWithinPartition` | `advangrid/cases/fanout_batch_order_test.go` `TestAppendKeepsSortedBatchOrder` | Not proposed |
 | 5. Data files never carry `sort_order_id` | #10: the rolling writer claims the id per file and drops it at the first order break | `table/rolling_data_writer_test.go` `TestWriterStampsSortOrderIDOnlyForFilesInOrder` | `advangrid/cases/sort_order_id_test.go` `TestSortOrderIDOnFilesInOrder` | Not proposed |
