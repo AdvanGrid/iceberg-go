@@ -361,6 +361,11 @@ type RollingDataWriter struct {
 	// that will ever reach recordCh.
 	sendMu      sync.RWMutex
 	noMoreSends bool
+
+	// streamErr is the first error that stopped stream. Add reports it after
+	// stream has stopped, so callers see the cause instead of ErrWriterClosed.
+	streamErrMu sync.Mutex
+	streamErr   error
 }
 
 func (w *writerFactory) recordQueueCapacity() int {
@@ -428,7 +433,7 @@ func (r *RollingDataWriter) Add(record arrow.RecordBatch) error {
 	defer r.sendMu.RUnlock()
 
 	if r.noMoreSends {
-		return ErrWriterClosed
+		return r.closedError(ErrWriterClosed)
 	}
 
 	record.Retain()
@@ -438,15 +443,27 @@ func (r *RollingDataWriter) Add(record arrow.RecordBatch) error {
 	case err, ok := <-r.errorCh:
 		record.Release()
 		if !ok {
-			return ErrWriterClosed
+			return r.closedError(ErrWriterClosed)
 		}
 
 		return err
 	case <-r.ctx.Done():
 		record.Release()
 
-		return r.ctx.Err()
+		return r.closedError(r.ctx.Err())
 	}
+}
+
+// closedError returns the error that stopped stream, or fallback when stream
+// has not failed.
+func (r *RollingDataWriter) closedError(fallback error) error {
+	r.streamErrMu.Lock()
+	defer r.streamErrMu.Unlock()
+	if r.streamErr != nil {
+		return r.streamErr
+	}
+
+	return fallback
 }
 
 func (r *RollingDataWriter) stream(outputDataFilesCh chan<- iceberg.DataFile) {
@@ -784,6 +801,12 @@ func inferShreddingFromBatches(buf []arrow.RecordBatch, limit int) map[int]arrow
 }
 
 func (r *RollingDataWriter) sendError(err error) {
+	r.streamErrMu.Lock()
+	if r.streamErr == nil {
+		r.streamErr = err
+	}
+	r.streamErrMu.Unlock()
+
 	select {
 	case r.errorCh <- err:
 	default:
