@@ -41,7 +41,7 @@ CI (`.github/workflows/advangrid.yml`) runs three jobs on pull requests and push
 | `integration`  | upstream's `make integration-setup` and `make integration-test` |
 | `differential` | `make advangrid-setup` and `make advangrid-test`           |
 
-Upstream's own workflows are disabled in this repository. The nightly scheduled run of `advangrid.yml` sets `LANE_NIGHTLY=1`, which runs the randomized test with more seeds and more steps.
+Upstream's own workflows are disabled in this repository. The `nightly` job runs on the daily schedule and on manual dispatch: `make advangrid-nightly` runs the randomized test over every layout with more steps (`LANE_NIGHTLY=1`), split into 8 shards (`LANE_SHARD=k/8`).
 
 To run the upstream integration lane locally: `make integration-setup`, export the variables printed by `make integration-env`, then `make integration-test`.
 
