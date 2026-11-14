@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/AdvanGrid/iceberg-go/advangrid/lane"
+	"github.com/apache/iceberg-go/table"
 	"github.com/stretchr/testify/require"
 )
 
@@ -36,7 +37,7 @@ func TestCompactsDuckDBDataFiles(t *testing.T) {
 	tbl = lk.Reload(t, tbl)
 	lk.RequireChecksum(t, tbl, 0, model.Checksum())
 
-	require.NoError(t, binPackCompact(ctx, tbl))
+	require.NoError(t, compact(ctx, tbl, table.BinPackStrategy))
 	tbl = lk.Reload(t, tbl)
 	lk.RequireChecksum(t, tbl, 0, model.Checksum())
 }
