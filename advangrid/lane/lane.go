@@ -90,7 +90,7 @@ func TableName(t testing.TB) string {
 func Ident(name string) table.Identifier { return catalog.ToIdentifier(Namespace, name) }
 
 // CreateTable creates a fresh table and drops it, with its files, when the
-// test ends.
+// test passes. A failed test keeps its table for inspection.
 func (l *Lake) CreateTable(t testing.TB, sc *iceberg.Schema, opts ...catalog.CreateTableOpt) *table.Table {
 	t.Helper()
 	name := TableName(t)
