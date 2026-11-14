@@ -189,7 +189,7 @@ type Checksums struct {
 func (l *Lake) Checksums(t testing.TB, tbl *table.Table, snapshotID int64) Checksums {
 	t.Helper()
 	ctx := context.Background()
-	name := tableName(tbl)
+	name := QualifiedName(tbl)
 	sc := tbl.Schema()
 
 	var opts []table.ScanOption
@@ -215,5 +215,5 @@ func (l *Lake) RequireChecksum(t testing.TB, tbl *table.Table, snapshotID int64,
 	t.Helper()
 	got := l.Checksums(t, tbl, snapshotID)
 	require.Equal(t, Checksums{IcebergGo: want, DuckDB: want, Spark: want}, got,
-		"table %s snapshot %d", tableName(tbl), snapshotID)
+		"table %s snapshot %d", QualifiedName(tbl), snapshotID)
 }

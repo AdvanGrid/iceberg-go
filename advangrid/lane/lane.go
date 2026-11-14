@@ -126,7 +126,9 @@ func SetDeleteMode(t testing.TB, tbl *table.Table, mode string) *table.Table {
 // DeleteModes are the delete modes every case runs under.
 var DeleteModes = []string{table.WriteModeCopyOnWrite, table.WriteModeMergeOnRead}
 
-func tableName(tbl *table.Table) string {
+// QualifiedName is the table's namespace and name, as DuckDB's lk and
+// Spark's lake catalogs name it.
+func QualifiedName(tbl *table.Table) string {
 	id := tbl.Identifier()
 
 	return fmt.Sprintf("%s.%s", id[len(id)-2], id[len(id)-1])

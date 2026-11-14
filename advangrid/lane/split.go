@@ -71,7 +71,7 @@ func inCatalog(d dialect, catalogName string) dialect {
 func (l *Lake) SplitChecksums(t testing.TB, tbl *table.Table) Checksums {
 	t.Helper()
 	ctx := context.Background()
-	name := tableName(tbl)
+	name := QualifiedName(tbl)
 	sc := tbl.Schema()
 
 	records, err := tbl.Scan().ToArrowTable(ctx)
