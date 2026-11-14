@@ -98,6 +98,28 @@ type writerFactory struct {
 	countMu               sync.Mutex
 	partitionIDCounter    atomic.Int64
 	mu                    sync.Mutex
+
+	// streamErr is the first error any rolling writer stopped on. A failed
+	// writer leaves the writers cache, so the factory keeps its error: no new
+	// writer starts after it and closeAll returns it, which keeps a later
+	// writer for the same partition from hiding the failed writer's lost rows.
+	streamErrMu sync.Mutex
+	streamErr   error
+}
+
+func (w *writerFactory) recordStreamError(err error) {
+	w.streamErrMu.Lock()
+	defer w.streamErrMu.Unlock()
+	if w.streamErr == nil {
+		w.streamErr = err
+	}
+}
+
+func (w *writerFactory) firstStreamError() error {
+	w.streamErrMu.Lock()
+	defer w.streamErrMu.Unlock()
+
+	return w.streamErr
 }
 
 type writerFactoryOption func(*writerFactory) error
@@ -432,6 +454,10 @@ func (w *writerFactory) getOrCreateRollingDataWriter(ctx context.Context, partit
 		}
 
 		return nil, fmt.Errorf("invalid writer type for partition: %s", partition)
+	}
+
+	if err := w.firstStreamError(); err != nil {
+		return nil, fmt.Errorf("error in rolling data writer: %w", err)
 	}
 
 	writer := w.newRollingDataWriter(ctx, partition, partitionValues, outputDataFilesCh)
@@ -862,6 +888,7 @@ func (r *RollingDataWriter) sendError(err error) {
 		r.streamErr = err
 	}
 	r.streamErrMu.Unlock()
+	r.factory.recordStreamError(err)
 
 	select {
 	case r.errorCh <- err:
@@ -912,6 +939,11 @@ func (w *writerFactory) closeAll() error {
 	for _, writer := range writers {
 		if closeErr := writer.closeAndWait(); closeErr != nil && err == nil {
 			err = closeErr
+		}
+	}
+	if err == nil {
+		if streamErr := w.firstStreamError(); streamErr != nil {
+			err = fmt.Errorf("error in rolling data writer: %w", streamErr)
 		}
 	}
 
