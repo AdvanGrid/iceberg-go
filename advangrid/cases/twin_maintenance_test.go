@@ -134,21 +134,45 @@ func runTwinMaintenance(t *testing.T, mode string) {
 	require.Len(t, tw.Go.Metadata().Snapshots(), 1)
 	require.Len(t, tw.Java.Metadata().Snapshots(), 1)
 
-	goBefore, javaBefore = goAfter, javaAfter
-	// Spark's procedure refuses an age under 24 hours; only its action API
-	// accepts less. Prefix listing lists through S3FileIO; the default lists
-	// through Hadoop, which has no s3 file system in the oracle. Both twins have no unreferenced objects here, so age 0
-	// and 24 hours delete the same files: none.
-	require.Empty(t, unreferenced(goBefore), "iceberg-go twin")
-	require.Empty(t, unreferenced(javaBefore), "spark twin")
+	orphans := []string{"data/twin-orphan.parquet", "metadata/twin-orphan.avro"}
+	lane.WriteObjects(t, tw.Go, orphans...)
+	lane.WriteObjects(t, tw.Java, orphans...)
+	goBefore, javaBefore = tw.files(t)
+	require.ElementsMatch(t, orphans, goBefore.Unreferenced(), "iceberg-go twin")
+	require.ElementsMatch(t, orphans, javaBefore.Unreferenced(), "spark twin")
 	_, err = tw.Go.DeleteOrphanFiles(ctx, table.WithFilesOlderThan(0))
 	require.NoError(t, err)
-	tw.spark(t, "CALL lake.system.remove_orphan_files(table => '%s', older_than => %s, prefix_listing => true)",
-		sparkName(tw.Java), sparkTimestamp(time.Now().Add(-24*time.Hour)))
+	removeOrphansWithSpark(t, tw, javaBefore)
 	tw.reload(t)
 	tw.requireSameContent(t, model, "orphan removal")
 	goAfter, javaAfter = tw.files(t)
-	require.Equal(t, lane.DeletedBetween(javaBefore, javaAfter), lane.DeletedBetween(goBefore, goAfter), "files deleted by orphan removal")
+	goRemoved, javaRemoved := lane.DeletedBetween(goBefore, goAfter), lane.DeletedBetween(javaBefore, javaAfter)
+	require.Equal(t, []string{"unreferenced " + orphans[0], "unreferenced " + orphans[1]}, goRemoved.Other)
+	require.Equal(t, javaRemoved, goRemoved, "files deleted by orphan removal")
+}
+
+// removeOrphansWithSpark runs Spark's orphan removal on the twin with the
+// listing in files, every object dated 2000-01-01. The procedure refuses an
+// age under 24 hours, and the oracle cannot list S3 itself: Java lists through
+// Hadoop, which has no s3 file system there, and Iceberg 1.8 has no prefix
+// listing in the procedure. The old dates make the 24-hour threshold act as
+// age 0, the threshold iceberg-go's twin runs with.
+func removeOrphansWithSpark(t *testing.T, tw *twins, files lane.FileSet) {
+	t.Helper()
+	view := "objects_" + tw.Java.Identifier()[len(tw.Java.Identifier())-1]
+	rows := make([]string, len(files.Objects))
+	for i, o := range files.Objects {
+		rows[i] = fmt.Sprintf("('%s', TIMESTAMP '2000-01-01 00:00:00')", o)
+	}
+	ctx := context.Background()
+	_, err := tw.lk.Spark.Query(ctx, fmt.Sprintf(
+		"CREATE OR REPLACE TEMPORARY VIEW %s AS SELECT * FROM VALUES %s AS t(file_path, last_modified)",
+		view, strings.Join(rows, ", ")))
+	require.NoError(t, err)
+	_, err = tw.lk.Spark.Query(ctx, fmt.Sprintf(
+		"CALL lake.system.remove_orphan_files(table => '%s', older_than => %s, file_list_view => '%s')",
+		sparkName(tw.Java), sparkTimestamp(time.Now().Add(-24*time.Hour)), view))
+	require.NoError(t, err)
 }
 
 // writeTwinHistory appends 200 rows for every third day of January to March
@@ -250,17 +274,6 @@ func compactTwins(t *testing.T, tw *twins, mode string) {
 			require.Zero(t, breaks, "order breaks in %s", f)
 		}
 	}
-}
-
-func unreferenced(fs lane.FileSet) []string {
-	var out []string
-	for _, o := range fs.Objects {
-		if _, ok := fs.Referenced[o]; !ok {
-			out = append(out, o)
-		}
-	}
-
-	return out
 }
 
 func droppedManifests(before, after lane.FileSet) int {

@@ -5,9 +5,11 @@ import (
 	"encoding/binary"
 	"fmt"
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/apache/iceberg-go"
+	icebergio "github.com/apache/iceberg-go/io"
 	"github.com/apache/iceberg-go/table"
 	"github.com/stretchr/testify/require"
 )
@@ -16,6 +18,7 @@ import (
 // the content identity of each referenced data file, and the objects under
 // its location.
 type FileSet struct {
+	Location   string
 	Referenced map[string]string
 	DataIDs    map[string]string
 	Objects    []string
@@ -32,7 +35,7 @@ func (l *Lake) Files(t testing.TB, tbl *table.Table) FileSet {
 	objects, err := l.Duck.ListObjects(ctx, tbl.Location())
 	require.NoError(t, err)
 
-	return FileSet{Referenced: ref, DataIDs: ids, Objects: objects}
+	return FileSet{Location: strings.TrimSuffix(tbl.Location(), "/"), Referenced: ref, DataIDs: ids, Objects: objects}
 }
 
 // DataFileIDs names every data and delete file the table's retained
@@ -100,7 +103,7 @@ func LiveDataIDs(t testing.TB, tbl *table.Table) []string {
 // kind each object had before the step. Data files are named by identity so
 // twins compare; manifests and manifest lists have no identity across tables
 // and are counted. Other holds deleted metadata files and objects that were
-// not referenced before.
+// not referenced before, by their path under the table location.
 type Deleted struct {
 	Data          []string
 	Deletes       []string
@@ -126,13 +129,14 @@ func DeletedBetween(before, after FileSet) Deleted {
 		case "manifest-list":
 			d.ManifestLists++
 		case "":
-			d.Other = append(d.Other, "unreferenced "+obj)
+			d.Other = append(d.Other, "unreferenced "+before.relative(obj))
 		default:
-			d.Other = append(d.Other, kind+" "+obj)
+			d.Other = append(d.Other, kind+" "+before.relative(obj))
 		}
 	}
 	slices.Sort(d.Data)
 	slices.Sort(d.Deletes)
+	slices.Sort(d.Other)
 
 	return d
 }
@@ -147,4 +151,33 @@ func CurrentManifests(t testing.TB, tbl *table.Table) int {
 	require.NoError(t, err)
 
 	return len(manifests)
+}
+
+func (fs FileSet) relative(path string) string {
+	return strings.TrimPrefix(path, fs.Location+"/")
+}
+
+// Unreferenced returns the listed objects the metadata does not reference,
+// by their path under the table location.
+func (fs FileSet) Unreferenced() []string {
+	var out []string
+	for _, o := range fs.Objects {
+		if _, ok := fs.Referenced[o]; !ok {
+			out = append(out, fs.relative(o))
+		}
+	}
+
+	return out
+}
+
+// WriteObjects writes a small object at each path under the table location.
+func WriteObjects(t testing.TB, tbl *table.Table, paths ...string) {
+	t.Helper()
+	fs, err := tbl.FS(context.Background())
+	require.NoError(t, err)
+	wfs, ok := fs.(icebergio.WriteFileIO)
+	require.True(t, ok, "table file IO cannot write")
+	for _, p := range paths {
+		require.NoError(t, wfs.WriteFile(strings.TrimSuffix(tbl.Location(), "/")+"/"+p, []byte("orphan")))
+	}
 }
