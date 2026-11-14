@@ -74,11 +74,8 @@ func (l *Lake) SplitChecksums(t testing.TB, tbl *table.Table) Checksums {
 	name := QualifiedName(tbl)
 	sc := tbl.Schema()
 
-	records, err := tbl.Scan().ToArrowTable(ctx)
+	goSum, err := ChecksumOfScan(ctx, sc, tbl.Scan())
 	require.NoError(t, err, "iceberg-go scan")
-	defer records.Release()
-	goSum, err := ChecksumOfRecords(sc, records)
-	require.NoError(t, err)
 
 	duckRow, err := l.Duck.Row(ctx, inCatalog(duckDialect, "sp").checksumSQL(sc, name, 0))
 	require.NoError(t, err, "duckdb checksum")

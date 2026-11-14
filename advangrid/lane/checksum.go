@@ -111,31 +111,82 @@ func joinChecksum(values []*string) Checksum {
 	return Checksum(strings.Join(parts, "|"))
 }
 
-// ChecksumOfRecords computes the checksum of Arrow data with the table's
-// schema, the way the engines compute it in SQL.
-func ChecksumOfRecords(sc *iceberg.Schema, tbl arrow.Table) (Checksum, error) {
+// checksumAccumulator sums the checksum columns batch by batch.
+type checksumAccumulator struct {
+	cols []column
+	sums []*big.Int
+	rows int64
+}
+
+func newChecksumAccumulator(sc *iceberg.Schema) *checksumAccumulator {
 	cols := checksumColumns(sc)
 	sums := make([]*big.Int, len(cols))
 	for i := range sums {
 		sums[i] = new(big.Int)
 	}
-	for i, c := range cols {
-		idx := tbl.Schema().FieldIndices(c.name)
+
+	return &checksumAccumulator{cols: cols, sums: sums}
+}
+
+func (a *checksumAccumulator) add(rec arrow.RecordBatch) error {
+	for i, c := range a.cols {
+		idx := rec.Schema().FieldIndices(c.name)
 		if len(idx) != 1 {
-			return "", fmt.Errorf("ChecksumOfRecords - column %s not found", c.name)
+			return fmt.Errorf("checksumAccumulator.add - column %s not found", c.name)
 		}
-		for _, chunk := range tbl.Column(idx[0]).Data().Chunks() {
-			if err := addColumn(sums[i], chunk); err != nil {
-				return "", fmt.Errorf("ChecksumOfRecords - %s: %w", c.name, err)
-			}
+		if err := addColumn(a.sums[i], rec.Column(idx[0])); err != nil {
+			return fmt.Errorf("checksumAccumulator.add - %s: %w", c.name, err)
 		}
 	}
-	parts := []string{fmt.Sprint(tbl.NumRows())}
-	for i, c := range cols {
-		parts = append(parts, formatScaled(sums[i], c.scale))
+	a.rows += rec.NumRows()
+
+	return nil
+}
+
+func (a *checksumAccumulator) checksum() Checksum {
+	parts := []string{fmt.Sprint(a.rows)}
+	for i, c := range a.cols {
+		parts = append(parts, formatScaled(a.sums[i], c.scale))
 	}
 
-	return Checksum(strings.Join(parts, "|")), nil
+	return Checksum(strings.Join(parts, "|"))
+}
+
+// ChecksumOfRecords computes the checksum of Arrow data with the table's
+// schema, the way the engines compute it in SQL.
+func ChecksumOfRecords(sc *iceberg.Schema, tbl arrow.Table) (Checksum, error) {
+	acc := newChecksumAccumulator(sc)
+	tr := array.NewTableReader(tbl, -1)
+	defer tr.Release()
+	for tr.Next() {
+		if err := acc.add(tr.RecordBatch()); err != nil {
+			return "", err
+		}
+	}
+
+	return acc.checksum(), nil
+}
+
+// ChecksumOfScan streams the scan's batches into the checksum, so the table
+// never has to fit in memory.
+func ChecksumOfScan(ctx context.Context, sc *iceberg.Schema, scan *table.Scan) (Checksum, error) {
+	_, records, err := scan.ToArrowRecords(ctx)
+	if err != nil {
+		return "", fmt.Errorf("ChecksumOfScan - scan: %w", err)
+	}
+	acc := newChecksumAccumulator(sc)
+	for rec, err := range records {
+		if err != nil {
+			return "", fmt.Errorf("ChecksumOfScan - read: %w", err)
+		}
+		err = acc.add(rec)
+		rec.Release()
+		if err != nil {
+			return "", err
+		}
+	}
+
+	return acc.checksum(), nil
 }
 
 func addColumn(sum *big.Int, arr arrow.Array) error {
@@ -196,11 +247,8 @@ func (l *Lake) Checksums(t testing.TB, tbl *table.Table, snapshotID int64) Check
 	if snapshotID != 0 {
 		opts = append(opts, table.WithSnapshotID(snapshotID))
 	}
-	records, err := tbl.Scan(opts...).ToArrowTable(ctx)
+	goSum, err := ChecksumOfScan(ctx, sc, tbl.Scan(opts...))
 	require.NoError(t, err, "iceberg-go scan")
-	defer records.Release()
-	goSum, err := ChecksumOfRecords(sc, records)
-	require.NoError(t, err)
 
 	duckRow, err := l.Duck.Row(ctx, duckDialect.checksumSQL(sc, name, snapshotID))
 	require.NoError(t, err, "duckdb checksum")

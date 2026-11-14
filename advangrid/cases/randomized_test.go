@@ -179,10 +179,7 @@ func requireRetainedSnapshots(t *testing.T, lk *lane.Lake, tbl *table.Table, che
 		if !ok {
 			continue
 		}
-		records, err := tbl.Scan(table.WithSnapshotID(s.SnapshotID)).ToArrowTable(context.Background())
-		require.NoError(t, err)
-		got, err := lane.ChecksumOfRecords(tbl.Schema(), records)
-		records.Release()
+		got, err := lane.ChecksumOfScan(context.Background(), tbl.Schema(), tbl.Scan(table.WithSnapshotID(s.SnapshotID)))
 		require.NoError(t, err)
 		require.Equal(t, want, got, "snapshot %d", s.SnapshotID)
 	}
