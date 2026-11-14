@@ -2474,7 +2474,7 @@ func (t *Transaction) performCopyOnWriteDeletion(ctx context.Context, operation 
 	}
 
 	if len(filesToRewrite) > 0 {
-		deletesByPath, err := t.deleteFilesByDataFile(ctx, meta, filter, caseSensitive)
+		deletesByPath, err := t.deleteFilesByDataFile(ctx, meta, filesToRewrite)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -2824,14 +2824,16 @@ type fileDeletes struct {
 }
 
 // deleteFilesByDataFile returns, keyed by data file path, the delete files of
-// the planning snapshot that apply to the data files filter may match. A
-// copy-on-write rewrite must apply them, or rows they delete come back.
-func (t *Transaction) deleteFilesByDataFile(ctx context.Context, meta *MetadataBuilder, filter iceberg.BooleanExpression, caseSensitive bool) (map[string]fileDeletes, error) {
+// the planning snapshot that apply to files. A copy-on-write rewrite must
+// apply them, or rows they delete come back. The plan has no row filter:
+// a rewrite keeps the rows outside the filter, so a delete file whose
+// bounds miss the filter still applies to the rows the rewrite keeps.
+func (t *Transaction) deleteFilesByDataFile(ctx context.Context, meta *MetadataBuilder, files []iceberg.DataFile) (map[string]fileDeletes, error) {
 	if t.planningSnapshot(meta) == nil {
 		return nil, nil
 	}
 
-	scan, err := t.Scan(WithRowFilter(filter), WithCaseSensitive(caseSensitive))
+	scan, err := t.Scan()
 	if err != nil {
 		return nil, err
 	}
@@ -2848,8 +2850,15 @@ func (t *Transaction) deleteFilesByDataFile(ctx context.Context, meta *MetadataB
 		return nil, fmt.Errorf("failed to plan delete files for rewrite: %w", err)
 	}
 
-	deletesByPath := make(map[string]fileDeletes)
+	rewritten := make(map[string]struct{}, len(files))
+	for _, f := range files {
+		rewritten[f.FilePath()] = struct{}{}
+	}
+	deletesByPath := make(map[string]fileDeletes, len(files))
 	for _, task := range tasks {
+		if _, ok := rewritten[task.File.FilePath()]; !ok {
+			continue
+		}
 		deletesByPath[task.File.FilePath()] = fileDeletes{
 			positional:      task.DeleteFiles,
 			equality:        task.EqualityDeleteFiles,
