@@ -26,6 +26,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"net"
 	pathpkg "path"
 	"slices"
 	"strings"
@@ -50,7 +51,37 @@ type blobOpenFile struct {
 	ctx       context.Context
 }
 
-func (f *blobOpenFile) ReadAt(p []byte, off int64) (n int, err error) {
+// rangeReadAttempts bounds how often ReadAt requests a range whose read
+// failed transiently; rangeReadBackoff is the wait before the first retry,
+// doubled for each later one.
+const (
+	rangeReadAttempts = 3
+	rangeReadBackoff  = 100 * time.Millisecond
+)
+
+// ReadAt reads len(p) bytes at off. A read that fails transiently, such as a
+// connection dropped mid-body, is retried from the bytes already read, up to
+// rangeReadAttempts requests.
+func (f *blobOpenFile) ReadAt(p []byte, off int64) (int, error) {
+	var n int
+	backoff := rangeReadBackoff
+	for attempt := 1; ; attempt++ {
+		read, err := f.readRange(p[n:], off+int64(n))
+		n += read
+		if err == nil || attempt == rangeReadAttempts || !f.retryable(err, off+int64(n)) {
+			return n, err
+		}
+
+		select {
+		case <-f.ctx.Done():
+			return n, err
+		case <-time.After(backoff):
+		}
+		backoff *= 2
+	}
+}
+
+func (f *blobOpenFile) readRange(p []byte, off int64) (n int, err error) {
 	var rdr io.ReadCloser
 	if f.b.newRangeReader != nil {
 		rdr, err = f.b.newRangeReader(f.ctx, f.key, off, int64(len(p)))
@@ -64,6 +95,18 @@ func (f *blobOpenFile) ReadAt(p []byte, off int64) (n int, err error) {
 	defer func() { err = errors.Join(err, rdr.Close()) }()
 
 	return io.ReadFull(rdr, p)
+}
+
+// retryable reports whether a range read that stopped at next failed
+// transiently: the object continues past next and the error is a cut body or
+// a network error, not a missing object or a cancelled context.
+func (f *blobOpenFile) retryable(err error, next int64) bool {
+	if f.ctx.Err() != nil || next >= f.Size() {
+		return false
+	}
+	var netErr net.Error
+
+	return errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, io.EOF) || errors.As(err, &netErr)
 }
 
 // Functions to implement the `Stat()` function in the `io/fs.File` interface
