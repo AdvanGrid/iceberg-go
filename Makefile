@@ -98,6 +98,9 @@ advangrid-setup:
 advangrid-test:
 	cd advangrid && go test -count=1 -timeout=60m ./...
 
+advangrid-nightly:
+	cd advangrid && LANE_NIGHTLY=1 go test -count=1 -timeout=5h -run '^TestRandomized$$' ./cases/
+
 advangrid-down:
 	$(ADVANGRID_COMPOSE) down -v
 

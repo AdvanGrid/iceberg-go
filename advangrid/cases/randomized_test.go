@@ -142,12 +142,29 @@ func randomizedRuns() []randomizedRun {
 	if os.Getenv("LANE_NIGHTLY") != "" {
 		layouts, steps = allLayouts(), 40
 	}
-	runs := make([]randomizedRun, len(layouts))
+	var runs []randomizedRun
 	for i, l := range layouts {
-		runs[i] = randomizedRun{layout: l, seed: uint64(i + 1), steps: steps}
+		if inShard(i) {
+			runs = append(runs, randomizedRun{layout: l, seed: uint64(i + 1), steps: steps})
+		}
 	}
 
 	return runs
+}
+
+// inShard reports whether the i-th run belongs to this process's shard.
+// LANE_SHARD is "k/n" (shard k of n); without it every run belongs.
+func inShard(i int) bool {
+	shard := os.Getenv("LANE_SHARD")
+	if shard == "" {
+		return true
+	}
+	var k, n int
+	if _, err := fmt.Sscanf(shard, "%d/%d", &k, &n); err != nil || n <= 0 {
+		panic(fmt.Sprintf("LANE_SHARD %q is not k/n", shard))
+	}
+
+	return i%n == k
 }
 
 // appendDays is the span of days one append covers, like an ingest run

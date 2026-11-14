@@ -41,7 +41,7 @@ CI (`.github/workflows/advangrid.yml`) runs three jobs on pull requests and push
 | `integration`  | upstream's `make integration-setup` and `make integration-test` |
 | `differential` | `make advangrid-setup` and `make advangrid-test`           |
 
-Upstream's own workflows are disabled in this repository. The nightly scheduled run of `advangrid.yml` sets `LANE_NIGHTLY=1`, which runs the randomized test with more seeds and more steps.
+Upstream's own workflows are disabled in this repository. The `nightly` job runs on the daily schedule and on manual dispatch: `make advangrid-nightly` runs the randomized test over every layout with more steps (`LANE_NIGHTLY=1`), split into 8 shards (`LANE_SHARD=k/8`).
 
 To run the upstream integration lane locally: `make integration-setup`, export the variables printed by `make integration-env`, then `make integration-test`.
 
@@ -78,3 +78,4 @@ Behaviour changes for callers:
 | 9. `file_format` matched case-sensitively | #13: `DataFile.FileFormat()` upper-cases the stored value | `manifest_test.go` `TestManifests/TestReadManifestNormalizesLowerCaseFileFormat` | `advangrid/cases/file_format_case_test.go` `TestCompactsDuckDBDataFiles` | Not proposed |
 | 10. Merge on append leaves its intermediate manifest | #9: the merge append deletes manifests the committed snapshot does not reference | `table/merge_append_cleanup_test.go` `TestMergeAppendLeavesNoUnreferencedManifests` | `advangrid/cases/merge_append_manifests_test.go` `TestMergeAppendLeavesNoOrphans` | Not proposed |
 | AdvanGrid/advangrid#2653. A failed partition writer drops rows silently | #14: the writer factory keeps the first writer error, refuses new writers after it, and closing returns it | `table/rolling_data_writer_test.go` `TestRollingDataWriter/TestPartitionWriterFailureIsNotLost` | `advangrid/cases/partition_writer_loss_test.go` `TestAppendReportsPartitionWriterFailure` | Not proposed |
+| AdvanGrid/advangrid#2655. A transient cut of a range read fails the scan | #19: `blobOpenFile.ReadAt` retries a cut range read up to 3 requests with backoff, resuming from the bytes read | `io/gocloud/blobfs/blob_test.go` `TestReadAtRetriesCutRangeRead`, `TestReadAtGivesUpOnPersistentCuts`, `TestReadAtDoesNotRetryPermanentErrors` | `advangrid/cases/range_read_retry_test.go` `TestScanSurvivesCutRangeReads` | Not proposed |
