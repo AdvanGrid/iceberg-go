@@ -56,6 +56,32 @@ func TestCopyOnWriteRewriteKeepsMergeOnReadDeletes(t *testing.T) {
 	}
 }
 
+// TestCopyOnWriteRewriteKeepsPrunableEqualityDeletes checks that a
+// copy-on-write rewrite applies an equality delete whose column bounds do
+// not overlap the rewrite's filter. The rewrite keeps the rows outside the
+// filter, which are exactly the rows such a delete removes; the rewritten
+// file gets a new sequence number, so the delete would never apply again.
+func TestCopyOnWriteRewriteKeepsPrunableEqualityDeletes(t *testing.T) {
+	ctx := context.Background()
+	tbl := newMergeOnReadTestTableVersion(t, "2")
+	tbl = appendTenRows(t, tbl)
+
+	records, release := makeEqDeleteRecords(t, idKeyArrowSchema(t), `[{"id": 7}]`)
+	defer release()
+	tx := tbl.NewTransaction()
+	require.NoError(t, tx.CommitEqualityDeletes(ctx, []int{1}, records, nil))
+	tbl, err := tx.Commit(ctx)
+	require.NoError(t, err)
+	require.Equal(t, []int64{1, 2, 3, 4, 5, 6, 8, 9, 10}, idsInTable(t, tbl))
+
+	tbl, err = tbl.Overwrite(ctx, emptyIDDataReader(t), nil,
+		table.WithOverwriteFilter(iceberg.LessThanEqual(iceberg.Reference("id"), int64(3))))
+	require.NoError(t, err)
+
+	assert.Equal(t, []int64{4, 5, 6, 8, 9, 10}, idsInTable(t, tbl),
+		"row 7 was deleted by an equality delete before the overwrite and must not come back")
+}
+
 func emptyIDDataReader(t *testing.T) array.RecordReader {
 	t.Helper()
 
