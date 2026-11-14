@@ -620,6 +620,62 @@ func (s *RollingDataWriterTestSuite) TestAddAfterStreamErrorReturnsCause() {
 	s.ErrorContains(err, "simulated open failure")
 }
 
+// failFirstOpenFormat fails only the first file open, simulating a
+// transient write error that a retry by a fresh writer would get past.
+type failFirstOpenFormat struct {
+	tblutils.FileFormat
+	opens *atomic.Int32
+}
+
+func (f failFirstOpenFormat) NewFileWriter(ctx context.Context, fs iceio.WriteFileIO, partitionValues map[int]any, info tblutils.WriteFileInfo, arrowSchema *arrow.Schema) (tblutils.FileWriter, error) {
+	if f.opens.Add(1) == 1 {
+		return nil, errors.New("simulated transient open failure")
+	}
+
+	return f.FileFormat.NewFileWriter(ctx, fs, partitionValues, info, arrowSchema)
+}
+
+// TestPartitionWriterFailureIsNotLost checks that when a partition's writer
+// stops on an error and a later record for the same partition is written, the
+// write reports that error. The failed writer leaves the factory's cache, so
+// the later record goes to a fresh writer that succeeds; closing must not then
+// report success with the first record's rows missing.
+func (s *RollingDataWriterTestSuite) TestPartitionWriterFailureIsNotLost() {
+	arrSchema := arrow.NewSchema([]arrow.Field{
+		{Name: "id", Type: arrow.PrimitiveTypes.Int32, Nullable: true},
+		{Name: "name", Type: arrow.BinaryTypes.String, Nullable: true},
+	}, nil)
+
+	loc := filepath.ToSlash(s.T().TempDir())
+	factory, _ := s.createWriterFactory(loc, arrSchema, 1024*1024)
+	var opens atomic.Int32
+	factory.format = failFirstOpenFormat{FileFormat: factory.format, opens: &opens}
+
+	outputCh := make(chan iceberg.DataFile, 10)
+	record := s.buildRecord(arrSchema, 3)
+	defer record.Release()
+
+	failed, err := factory.getOrCreateRollingDataWriter(s.ctx, "p", nil, outputCh)
+	s.Require().NoError(err)
+	s.Require().NoError(failed.Add(record))
+	failed.wg.Wait()
+
+	addErr := func() error {
+		writer, err := factory.getOrCreateRollingDataWriter(s.ctx, "p", nil, outputCh)
+		if err != nil {
+			return err
+		}
+
+		return writer.Add(record)
+	}()
+	closeErr := factory.closeAll()
+	close(outputCh)
+	for range outputCh {
+	}
+
+	s.ErrorContains(errors.Join(addErr, closeErr), "simulated transient open failure")
+}
+
 func (s *RollingDataWriterTestSuite) TestStreamErrorRemovesWriterFromFactory() {
 	writerSchema := arrow.NewSchema([]arrow.Field{
 		{Name: "id", Type: arrow.PrimitiveTypes.Int32, Nullable: true},
