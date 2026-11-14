@@ -391,6 +391,7 @@ func (w *captureFileWriter) Write(batch arrow.RecordBatch) error {
 }
 
 func (w *captureFileWriter) BytesWritten() int64              { return 0 }
+func (w *captureFileWriter) DropSortOrder()                   {}
 func (w *captureFileWriter) Close() (iceberg.DataFile, error) { return nil, nil }
 func (w *captureFileWriter) Abort() error                     { return nil }
 

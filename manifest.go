@@ -2816,7 +2816,13 @@ func (d *dataFile) setFieldIDToDecimalScaleMap(m map[int]int) {
 
 func (d *dataFile) ContentType() ManifestEntryContent { return d.Content }
 func (d *dataFile) FilePath() string                  { return d.Path }
-func (d *dataFile) FileFormat() FileFormat            { return d.Format }
+
+// FileFormat returns the file's format in its canonical upper-case form. The
+// spec does not fix the case of file_format, and some writers, such as DuckDB,
+// record it in lower case.
+func (d *dataFile) FileFormat() FileFormat {
+	return FileFormat(strings.ToUpper(string(d.Format)))
+}
 
 // Partition returns the partition data as a map of partition field ID to value.
 func (d *dataFile) Partition() map[int]any {

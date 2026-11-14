@@ -80,6 +80,9 @@ type FileWriter interface {
 	Write(arrow.RecordBatch) error
 	BytesWritten() int64
 	Close() (iceberg.DataFile, error)
+	// DropSortOrder withdraws the file's sort order claim
+	// (WriteFileInfo.SortOrderID): Close then records no sort order id.
+	DropSortOrder()
 	// Abort closes the underlying file handle without finalizing the
 	// file format (e.g. Parquet footer). It is safe to call regardless
 	// of how many rows have been written and should be used on error

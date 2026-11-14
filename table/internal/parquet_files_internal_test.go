@@ -50,6 +50,8 @@ func (*failingWriteFileWriter) BytesWritten() int64 {
 	return 0
 }
 
+func (*failingWriteFileWriter) DropSortOrder() {}
+
 func (w *failingWriteFileWriter) Close() (iceberg.DataFile, error) {
 	w.closeCalled = true
 

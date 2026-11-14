@@ -1258,6 +1258,10 @@ func (w *ParquetFileWriter) Close() (_ iceberg.DataFile, err error) {
 	}), nil
 }
 
+func (w *ParquetFileWriter) DropSortOrder() {
+	w.info.SortOrderID = 0
+}
+
 func (w *ParquetFileWriter) Abort() error {
 	closeErr := w.fileCloser.Close()
 	removeErr := w.fs.Remove(w.info.FileName)

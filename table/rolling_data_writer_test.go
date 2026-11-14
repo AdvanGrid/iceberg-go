@@ -428,74 +428,86 @@ func (s *RollingDataWriterTestSuite) TestBytesWrittenNoDoubleCountAcrossRowGroup
 
 // The rolling path sorts per batch but takes no per-task claim, so the emitted
 // DataFile must not claim the table's sort order even when one is set.
-func (s *RollingDataWriterTestSuite) TestWriterFactoryDoesNotStampSortOrderID() {
+// TestWriterStampsSortOrderIDOnlyForFilesInOrder writes batches to a table
+// sorted by id. Each batch is sorted on its own, so a file is in the declared
+// order unless a batch starts below the end of the batch before it in the
+// same file; only files in order may carry the sort order id.
+func (s *RollingDataWriterTestSuite) TestWriterStampsSortOrderIDOnlyForFilesInOrder() {
 	arrSchema := arrow.NewSchema([]arrow.Field{
 		{Name: "id", Type: arrow.PrimitiveTypes.Int32, Nullable: true},
 		{Name: "name", Type: arrow.BinaryTypes.String, Nullable: true},
 	}, nil)
 
-	icebergSchema, err := ArrowSchemaToIcebergWithFreshIDs(arrSchema, false)
-	s.Require().NoError(err)
+	tests := []struct {
+		name           string
+		batches        [][]int32
+		targetFileSize int64
+		wantIDs        []*int
+	}{
+		{"one unsorted batch is sorted by the writer", [][]int32{{3, 1, 2}}, 1024 * 1024, []*int{ptr(1)}},
+		{"batches in order", [][]int32{{1, 2}, {2, 4}, {5}}, 1024 * 1024, []*int{ptr(1)}},
+		{"a batch starting below the previous one", [][]int32{{1, 5}, {3, 4}}, 1024 * 1024, []*int{nil}},
+		{"a break across files is not a break", [][]int32{{1, 5}, {3, 4}}, 1, []*int{ptr(1), ptr(1)}},
+	}
+	for _, tt := range tests {
+		s.Run(tt.name, func() {
+			loc := filepath.ToSlash(s.T().TempDir())
+			icebergSchema, err := ArrowSchemaToIcebergWithFreshIDs(arrSchema, false)
+			s.Require().NoError(err)
+			sortOrder, err := NewSortOrder(1, []SortField{{
+				SourceIDs: []int{icebergSchema.Fields()[0].ID},
+				Direction: SortASC,
+				Transform: iceberg.IdentityTransform{},
+				NullOrder: NullsFirst,
+			}})
+			s.Require().NoError(err)
+			spec := iceberg.NewPartitionSpec()
+			meta, err := NewMetadata(icebergSchema, &spec, sortOrder, loc, iceberg.Properties{})
+			s.Require().NoError(err)
+			s.Require().Equal(1, meta.DefaultSortOrder())
+			metaBuilder, err := MetadataBuilderFromBase(meta, "")
+			s.Require().NoError(err)
 
-	spec := iceberg.NewPartitionSpec()
-	sortOrder, err := NewSortOrder(1, []SortField{{
-		SourceIDs: []int{icebergSchema.Fields()[0].ID},
-		Direction: SortASC,
-		Transform: iceberg.IdentityTransform{},
-		NullOrder: NullsFirst,
-	}})
-	s.Require().NoError(err)
-
-	loc := filepath.ToSlash(s.T().TempDir())
-	meta, err := NewMetadata(icebergSchema, &spec, UnsortedSortOrder, loc, iceberg.Properties{})
-	s.Require().NoError(err)
-	metaBuilder, err := MetadataBuilderFromBase(meta, "")
-	s.Require().NoError(err)
-	s.Require().NoError(metaBuilder.AddSortOrder(&sortOrder))
-	// -1 means "use the sort order that was just added". AddSortOrder
-	// re-maps the caller-supplied ID, so we can't refer to it by literal.
-	s.Require().NoError(metaBuilder.SetDefaultSortOrderID(-1))
-	builtMeta, err := metaBuilder.Build()
-	s.Require().NoError(err)
-	s.Require().NotEqual(UnsortedSortOrderID, builtMeta.DefaultSortOrder(),
-		"sanity: sort order id should be non-zero")
-
-	writeUUID := uuid.New()
-	args := recordWritingArgs{
-		sc:        arrSchema,
-		fs:        iceio.LocalFS{},
-		writeUUID: &writeUUID,
-		counter: func(yield func(int) bool) {
-			for i := 0; ; i++ {
-				if !yield(i) {
-					break
-				}
+			writeUUID := uuid.New()
+			args := recordWritingArgs{
+				sc:        arrSchema,
+				fs:        iceio.LocalFS{},
+				writeUUID: &writeUUID,
+				counter: func(yield func(int) bool) {
+					for i := 0; ; i++ {
+						if !yield(i) {
+							break
+						}
+					}
+				},
 			}
-		},
+			factory, err := newWriterFactory(loc, args, metaBuilder, icebergSchema, tt.targetFileSize)
+			s.Require().NoError(err)
+			defer factory.closeAll()
+
+			outputCh := make(chan iceberg.DataFile, 10)
+			writer := factory.newRollingDataWriter(s.ctx, "", nil, outputCh)
+			for _, ids := range tt.batches {
+				bldr := array.NewRecordBuilder(s.mem, arrSchema)
+				for _, id := range ids {
+					bldr.Field(0).(*array.Int32Builder).Append(id)
+					bldr.Field(1).(*array.StringBuilder).Append("value")
+				}
+				record := bldr.NewRecordBatch()
+				bldr.Release()
+				s.Require().NoError(writer.Add(record))
+				record.Release()
+			}
+			s.Require().NoError(writer.closeAndWait())
+			close(outputCh)
+
+			var gotIDs []*int
+			for df := range outputCh {
+				gotIDs = append(gotIDs, df.SortOrderID())
+			}
+			s.Equal(tt.wantIDs, gotIDs)
+		})
 	}
-
-	factory, err := newWriterFactory(loc, args, metaBuilder, icebergSchema, 1024*1024)
-	s.Require().NoError(err)
-	defer factory.closeAll()
-
-	outputCh := make(chan iceberg.DataFile, 10)
-	writer := factory.newRollingDataWriter(s.ctx, "", nil, outputCh)
-
-	record := s.buildRecord(arrSchema, 5)
-	defer record.Release()
-
-	s.Require().NoError(writer.Add(record))
-	s.Require().NoError(writer.closeAndWait())
-	close(outputCh)
-
-	var dataFiles []iceberg.DataFile
-	for df := range outputCh {
-		dataFiles = append(dataFiles, df)
-	}
-
-	s.Require().Len(dataFiles, 1)
-	s.Nil(dataFiles[0].SortOrderID(),
-		"emitted DataFile must not claim a sort order id: batches are only sorted individually")
 }
 
 func (s *RollingDataWriterTestSuite) TestAbortWithZeroRowsWritten() {
@@ -577,6 +589,91 @@ func (s *RollingDataWriterTestSuite) TestAddReturnsErrorAfterStreamStopsCleanly(
 	}
 
 	s.ErrorIs(writer.Add(record), ErrWriterClosed)
+}
+
+// TestAddAfterStreamErrorReturnsCause checks that once stream has stopped on
+// a write error, Add reports that error rather than the generic
+// ErrWriterClosed, so the caller learns why the write failed.
+func (s *RollingDataWriterTestSuite) TestAddAfterStreamErrorReturnsCause() {
+	arrSchema := arrow.NewSchema([]arrow.Field{
+		{Name: "id", Type: arrow.PrimitiveTypes.Int32, Nullable: true},
+		{Name: "name", Type: arrow.BinaryTypes.String, Nullable: true},
+	}, nil)
+
+	loc := filepath.ToSlash(s.T().TempDir())
+	factory, _ := s.createWriterFactory(loc, arrSchema, 1024*1024)
+	defer factory.closeAll()
+	factory.format = failingOpenFormat{FileFormat: factory.format}
+
+	outputCh := make(chan iceberg.DataFile, 10)
+	writer := factory.newRollingDataWriter(s.ctx, "", nil, outputCh)
+
+	record := s.buildRecord(arrSchema, 3)
+	defer record.Release()
+
+	s.Require().NoError(writer.Add(record))
+	writer.wg.Wait()
+
+	err := writer.Add(record)
+	s.Require().Error(err)
+	s.NotErrorIs(err, ErrWriterClosed)
+	s.ErrorContains(err, "simulated open failure")
+}
+
+// failFirstOpenFormat fails only the first file open, simulating a
+// transient write error that a retry by a fresh writer would get past.
+type failFirstOpenFormat struct {
+	tblutils.FileFormat
+	opens *atomic.Int32
+}
+
+func (f failFirstOpenFormat) NewFileWriter(ctx context.Context, fs iceio.WriteFileIO, partitionValues map[int]any, info tblutils.WriteFileInfo, arrowSchema *arrow.Schema) (tblutils.FileWriter, error) {
+	if f.opens.Add(1) == 1 {
+		return nil, errors.New("simulated transient open failure")
+	}
+
+	return f.FileFormat.NewFileWriter(ctx, fs, partitionValues, info, arrowSchema)
+}
+
+// TestPartitionWriterFailureIsNotLost checks that when a partition's writer
+// stops on an error and a later record for the same partition is written, the
+// write reports that error. The failed writer leaves the factory's cache, so
+// the later record goes to a fresh writer that succeeds; closing must not then
+// report success with the first record's rows missing.
+func (s *RollingDataWriterTestSuite) TestPartitionWriterFailureIsNotLost() {
+	arrSchema := arrow.NewSchema([]arrow.Field{
+		{Name: "id", Type: arrow.PrimitiveTypes.Int32, Nullable: true},
+		{Name: "name", Type: arrow.BinaryTypes.String, Nullable: true},
+	}, nil)
+
+	loc := filepath.ToSlash(s.T().TempDir())
+	factory, _ := s.createWriterFactory(loc, arrSchema, 1024*1024)
+	var opens atomic.Int32
+	factory.format = failFirstOpenFormat{FileFormat: factory.format, opens: &opens}
+
+	outputCh := make(chan iceberg.DataFile, 10)
+	record := s.buildRecord(arrSchema, 3)
+	defer record.Release()
+
+	failed, err := factory.getOrCreateRollingDataWriter(s.ctx, "p", nil, outputCh)
+	s.Require().NoError(err)
+	s.Require().NoError(failed.Add(record))
+	failed.wg.Wait()
+
+	addErr := func() error {
+		writer, err := factory.getOrCreateRollingDataWriter(s.ctx, "p", nil, outputCh)
+		if err != nil {
+			return err
+		}
+
+		return writer.Add(record)
+	}()
+	closeErr := factory.closeAll()
+	close(outputCh)
+	for range outputCh {
+	}
+
+	s.ErrorContains(errors.Join(addErr, closeErr), "simulated transient open failure")
 }
 
 func (s *RollingDataWriterTestSuite) TestStreamErrorRemovesWriterFromFactory() {
@@ -928,6 +1025,7 @@ type panicOnCloseWriter struct {
 
 func (panicOnCloseWriter) Write(arrow.RecordBatch) error { return nil }
 func (w panicOnCloseWriter) BytesWritten() int64         { return w.bytesWritten }
+func (panicOnCloseWriter) DropSortOrder()                {}
 func (panicOnCloseWriter) Close() (iceberg.DataFile, error) {
 	panic(errors.New("simulated NewDataFileBuilder failure"))
 }

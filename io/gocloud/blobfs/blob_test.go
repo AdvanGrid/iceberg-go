@@ -18,12 +18,15 @@
 package blobfs
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"io"
 	"io/fs"
+	"net"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -927,4 +930,134 @@ func TestBlobFileIORemoveFallsBackToDirectoryMarker(t *testing.T) {
 	exists, err := bucket.Exists(ctx, "ns/tbl/")
 	require.NoError(t, err)
 	assert.False(t, exists)
+}
+
+type failingReader struct{ err error }
+
+func (r failingReader) Read([]byte) (int, error) { return 0, r.err }
+
+// cutRangeReader returns a range reader hook that serves the first cuts
+// requests with only half the range followed by err, as a connection dropped
+// mid-body does, and serves later requests in full. It counts every request.
+func cutRangeReader(bucket *blob.Bucket, cuts int, err error, calls *int) func(context.Context, string, int64, int64) (io.ReadCloser, error) {
+	return func(ctx context.Context, key string, offset, length int64) (io.ReadCloser, error) {
+		*calls++
+		r, rangeErr := bucket.NewRangeReader(ctx, key, offset, length, nil)
+		if rangeErr != nil {
+			return nil, rangeErr
+		}
+		if *calls > cuts {
+			return r, nil
+		}
+		half := make([]byte, length/2)
+		if _, err := io.ReadFull(r, half); err != nil {
+			return nil, errors.Join(err, r.Close())
+		}
+		if err := r.Close(); err != nil {
+			return nil, err
+		}
+
+		return io.NopCloser(io.MultiReader(bytes.NewReader(half), failingReader{err: err})), nil
+	}
+}
+
+func TestReadAtRetriesCutRangeRead(t *testing.T) {
+	ctx := context.Background()
+	bucket := memblob.OpenBucket(nil)
+	defer bucket.Close()
+
+	content := bytes.Repeat([]byte("0123456789"), 10)
+	require.NoError(t, bucket.WriteAll(ctx, "test-file", content, nil))
+
+	connReset := &net.OpError{Op: "read", Net: "tcp", Err: syscall.ECONNRESET}
+	for _, cutErr := range []error{io.ErrUnexpectedEOF, connReset} {
+		t.Run(cutErr.Error(), func(t *testing.T) {
+			var calls int
+			bfs := &FileIO{
+				Bucket: bucket, extractObject: identityObjectLocation, ctx: ctx,
+				newRangeReader: cutRangeReader(bucket, 1, cutErr, &calls),
+			}
+			file, err := bfs.Open("test-file")
+			require.NoError(t, err)
+			defer file.Close()
+
+			buf := make([]byte, 60)
+			n, err := file.(*blobOpenFile).ReadAt(buf, 20)
+			require.NoError(t, err)
+			assert.Equal(t, 60, n)
+			assert.Equal(t, content[20:80], buf)
+		})
+	}
+}
+
+func TestReadAtGivesUpOnPersistentCuts(t *testing.T) {
+	ctx := context.Background()
+	bucket := memblob.OpenBucket(nil)
+	defer bucket.Close()
+
+	content := bytes.Repeat([]byte("0123456789"), 10)
+	require.NoError(t, bucket.WriteAll(ctx, "test-file", content, nil))
+
+	var calls int
+	bfs := &FileIO{
+		Bucket: bucket, extractObject: identityObjectLocation, ctx: ctx,
+		newRangeReader: cutRangeReader(bucket, 1000, io.ErrUnexpectedEOF, &calls),
+	}
+	file, err := bfs.Open("test-file")
+	require.NoError(t, err)
+	defer file.Close()
+
+	_, err = file.(*blobOpenFile).ReadAt(make([]byte, 64), 0)
+	assert.ErrorIs(t, err, io.ErrUnexpectedEOF)
+	assert.Greater(t, calls, 1, "a cut range read is retried")
+	assert.LessOrEqual(t, calls, 5, "retries are bounded")
+}
+
+func TestReadAtDoesNotRetryPermanentErrors(t *testing.T) {
+	ctx := context.Background()
+	bucket := memblob.OpenBucket(nil)
+	defer bucket.Close()
+
+	content := bytes.Repeat([]byte("0123456789"), 10)
+	require.NoError(t, bucket.WriteAll(ctx, "test-file", content, nil))
+
+	t.Run("not found", func(t *testing.T) {
+		var calls int
+		bfs := &FileIO{
+			Bucket: bucket, extractObject: identityObjectLocation, ctx: ctx,
+			newRangeReader: func(ctx context.Context, key string, offset, length int64) (io.ReadCloser, error) {
+				calls++
+
+				return bucket.NewRangeReader(ctx, "missing", offset, length, nil)
+			},
+		}
+		file, err := bfs.Open("test-file")
+		require.NoError(t, err)
+		defer file.Close()
+
+		_, err = file.(*blobOpenFile).ReadAt(make([]byte, 10), 0)
+		assert.Equal(t, gcerrors.NotFound, gcerrors.Code(err))
+		assert.Equal(t, 1, calls)
+	})
+
+	t.Run("cancelled context", func(t *testing.T) {
+		readCtx, cancel := context.WithCancel(ctx)
+		var calls int
+		cut := cutRangeReader(bucket, 1000, io.ErrUnexpectedEOF, &calls)
+		bfs := &FileIO{
+			Bucket: bucket, extractObject: identityObjectLocation, ctx: readCtx,
+			newRangeReader: func(ctx context.Context, key string, offset, length int64) (io.ReadCloser, error) {
+				defer cancel()
+
+				return cut(ctx, key, offset, length)
+			},
+		}
+		file, err := bfs.Open("test-file")
+		require.NoError(t, err)
+		defer file.Close()
+
+		_, err = file.(*blobOpenFile).ReadAt(make([]byte, 64), 0)
+		assert.Error(t, err)
+		assert.Equal(t, 1, calls)
+	})
 }

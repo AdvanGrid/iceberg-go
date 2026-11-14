@@ -1655,6 +1655,36 @@ func (m *ManifestTestSuite) TestV3DataManifestFirstRowIDInheritanceSkipsDeletedE
 	m.EqualValues(1000+liveCount, *read[2].DataFile().FirstRowID())
 }
 
+// TestReadManifestNormalizesLowerCaseFileFormat reads a manifest whose entry
+// records file_format in lower case, as DuckDB writes it. The spec does not fix
+// the case, and Java parses it case-insensitively, so the entry must report
+// the canonical format.
+func (m *ManifestTestSuite) TestReadManifestNormalizesLowerCaseFileFormat() {
+	partitionSpec := NewPartitionSpecID(1,
+		PartitionField{FieldID: 1000, SourceIDs: []int{1}, Name: "x", Transform: IdentityTransform{}})
+	seqNum := int64(1)
+	entries := []ManifestEntry{&manifestEntry{
+		EntryStatus: EntryStatusADDED, Snapshot: &entrySnapshotID, SeqNum: &seqNum, FileSeqNum: &seqNum,
+		Data: &dataFile{
+			Content:       EntryContentData,
+			Path:          "/data/duckdb.parquet",
+			Format:        "parquet",
+			PartitionData: map[string]any{"x": int(1)},
+			RecordCount:   10,
+			FileSize:      1000,
+		},
+	}}
+	var manifestBuf bytes.Buffer
+	_, err := WriteManifest("/manifest.avro", &manifestBuf, 2, partitionSpec, testSchema, entrySnapshotID, entries)
+	m.Require().NoError(err)
+
+	file := &manifestFile{version: 2, Path: "/manifest.avro", Content: ManifestContentData}
+	read, err := ReadManifest(file, bytes.NewReader(manifestBuf.Bytes()), false)
+	m.Require().NoError(err)
+	m.Require().Len(read, 1)
+	m.Equal(ParquetFile, read[0].DataFile().FileFormat())
+}
+
 func (m *ManifestTestSuite) TestWriteManifestV3() {
 	partitionSpec := NewPartitionSpecID(1,
 		PartitionField{FieldID: 1000, SourceIDs: []int{1}, Name: "x", Transform: IdentityTransform{}})
