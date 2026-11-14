@@ -29,6 +29,7 @@ import (
 	"runtime"
 	"slices"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -2473,7 +2474,11 @@ func (t *Transaction) performCopyOnWriteDeletion(ctx context.Context, operation 
 	}
 
 	if len(filesToRewrite) > 0 {
-		if err := t.rewriteFilesWithFilter(ctx, fs, updater, filesToRewrite, fileSeqByPath, filter, caseSensitive, concurrency); err != nil {
+		deletesByPath, err := t.deleteFilesByDataFile(ctx, meta, filter, caseSensitive)
+		if err != nil {
+			return nil, nil, err
+		}
+		if err := t.rewriteFilesWithFilter(ctx, fs, updater, filesToRewrite, fileSeqByPath, deletesByPath, filter, caseSensitive, concurrency); err != nil {
 			return nil, nil, err
 		}
 	}
@@ -2813,11 +2818,53 @@ func (t *Transaction) classifyFilesForFilteredDeletions(ctx context.Context, fs 
 	return filesToDelete, filesWithPartialDeletes, fileSeqByPath, nil
 }
 
+// fileDeletes are the delete files of every kind that apply to one data file.
+type fileDeletes struct {
+	positional, equality, deletionVectors []iceberg.DataFile
+}
+
+// deleteFilesByDataFile returns, keyed by data file path, the delete files of
+// the planning snapshot that apply to the data files filter may match. A
+// copy-on-write rewrite must apply them, or rows they delete come back.
+func (t *Transaction) deleteFilesByDataFile(ctx context.Context, meta *MetadataBuilder, filter iceberg.BooleanExpression, caseSensitive bool) (map[string]fileDeletes, error) {
+	if t.planningSnapshot(meta) == nil {
+		return nil, nil
+	}
+
+	scan, err := t.Scan(WithRowFilter(filter), WithCaseSensitive(caseSensitive))
+	if err != nil {
+		return nil, err
+	}
+	branch := t.branch
+	if branch == "" {
+		branch = MainBranch
+	}
+	scan, err = scan.UseRef(branch)
+	if err != nil {
+		return nil, err
+	}
+	tasks, err := scan.PlanFiles(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to plan delete files for rewrite: %w", err)
+	}
+
+	deletesByPath := make(map[string]fileDeletes)
+	for _, task := range tasks {
+		deletesByPath[task.File.FilePath()] = fileDeletes{
+			positional:      task.DeleteFiles,
+			equality:        task.EqualityDeleteFiles,
+			deletionVectors: task.DeletionVectorFiles,
+		}
+	}
+
+	return deletesByPath, nil
+}
+
 // rewriteFilesWithFilter rewrites data files by preserving only rows that do NOT match the filter.
 // fileSeqByPath maps each file's path to its file_sequence_number from the source manifest entry,
 // used to synthesize _last_updated_sequence_number when the source row's value is null. The
 // filter binding and substrait conversion are computed once here and reused across every file.
-func (t *Transaction) rewriteFilesWithFilter(ctx context.Context, fs io.IO, updater *snapshotProducer, files []iceberg.DataFile, fileSeqByPath map[string]*int64, filter iceberg.BooleanExpression, caseSensitive bool, concurrency int) error {
+func (t *Transaction) rewriteFilesWithFilter(ctx context.Context, fs io.IO, updater *snapshotProducer, files []iceberg.DataFile, fileSeqByPath map[string]*int64, deletesByPath map[string]fileDeletes, filter iceberg.BooleanExpression, caseSensitive bool, concurrency int) error {
 	meta, err := t.txnMeta()
 	if err != nil {
 		return err
@@ -2841,6 +2888,7 @@ func (t *Transaction) rewriteFilesWithFilter(ctx context.Context, fs io.IO, upda
 			fs:            fs,
 			originalFile:  originalFile,
 			fileSeqNum:    fileSeqByPath[originalFile.FilePath()],
+			deletes:       deletesByPath[originalFile.FilePath()],
 			filter:        complementFilter,
 			postFilter:    postFilter,
 			caseSensitive: caseSensitive,
@@ -2871,6 +2919,9 @@ type rewriteSingleFileArgs struct {
 	// manifest entry; required to synthesize _last_updated_sequence_number
 	// for rows whose value is null in the source file.
 	fileSeqNum *int64
+	// deletes are the delete files that apply to originalFile; rows they
+	// delete are not carried into the rewritten files.
+	deletes fileDeletes
 	// filter is the per-row complement (rows that survive the rewrite).
 	filter iceberg.BooleanExpression
 	// postFilter is the pre-bound, pre-substrait-converted version of
@@ -2893,9 +2944,12 @@ func (t *Transaction) rewriteSingleFile(ctx context.Context, args rewriteSingleF
 	}
 
 	scanTask := &FileScanTask{
-		File:   args.originalFile,
-		Start:  0,
-		Length: args.originalFile.FileSizeBytes(),
+		File:                args.originalFile,
+		DeleteFiles:         args.deletes.positional,
+		EqualityDeleteFiles: args.deletes.equality,
+		DeletionVectorFiles: args.deletes.deletionVectors,
+		Start:               0,
+		Length:              args.originalFile.FileSizeBytes(),
 	}
 
 	// Preserve row lineage for v3 tables: include _row_id and
@@ -3174,6 +3228,9 @@ func (t *Transaction) makePositionDeleteRecordsForFilter(ctx context.Context, fs
 		return nil, err
 	}
 
+	// The spec requires position delete files to be sorted by (file_path,
+	// pos). The records below are yielded in task order, and positions
+	// ascend within a task, so ordering the tasks by path is sufficient.
 	tasks := make([]FileScanTask, 0, len(files))
 	for _, f := range files {
 		tasks = append(tasks, FileScanTask{
@@ -3182,6 +3239,9 @@ func (t *Transaction) makePositionDeleteRecordsForFilter(ctx context.Context, fs
 			Length: f.FileSizeBytes(),
 		})
 	}
+	slices.SortFunc(tasks, func(a, b FileScanTask) int {
+		return strings.Compare(a.File.FilePath(), b.File.FilePath())
+	})
 
 	boundFilter, err := iceberg.BindExpr(meta.CurrentSchema(), filter, caseSensitive)
 	if err != nil {

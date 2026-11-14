@@ -27,6 +27,9 @@ import (
 // Analyze scans the table and produces a compaction Plan without
 // modifying anything. This is the dry-run / planning entry point.
 func Analyze(ctx context.Context, tbl *table.Table, cfg Config) (Plan, error) {
+	if cfg.Strategy == table.SortStrategy && tbl.SortOrder().IsUnsorted() {
+		return Plan{}, fmt.Errorf("%w: the sort strategy needs a table sort order", table.ErrInvalidOperation)
+	}
 	tasks, err := tbl.Scan().PlanFiles(ctx)
 	if err != nil {
 		return Plan{}, fmt.Errorf("plan files for compaction analysis: %w", err)
