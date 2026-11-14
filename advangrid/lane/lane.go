@@ -97,6 +97,11 @@ func (l *Lake) CreateTable(t testing.TB, sc *iceberg.Schema, opts ...catalog.Cre
 	tbl, err := l.Catalog.CreateTable(context.Background(), Ident(name), sc, opts...)
 	require.NoError(t, err, "create %s", name)
 	t.Cleanup(func() {
+		if t.Failed() {
+			t.Logf("kept table %s.%s for inspection", Namespace, name)
+
+			return
+		}
 		_ = l.Catalog.DropTable(context.Background(), Ident(name))
 	})
 
