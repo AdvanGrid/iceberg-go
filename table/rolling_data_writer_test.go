@@ -579,6 +579,35 @@ func (s *RollingDataWriterTestSuite) TestAddReturnsErrorAfterStreamStopsCleanly(
 	s.ErrorIs(writer.Add(record), ErrWriterClosed)
 }
 
+// TestAddAfterStreamErrorReturnsCause checks that once stream has stopped on
+// a write error, Add reports that error rather than the generic
+// ErrWriterClosed, so the caller learns why the write failed.
+func (s *RollingDataWriterTestSuite) TestAddAfterStreamErrorReturnsCause() {
+	arrSchema := arrow.NewSchema([]arrow.Field{
+		{Name: "id", Type: arrow.PrimitiveTypes.Int32, Nullable: true},
+		{Name: "name", Type: arrow.BinaryTypes.String, Nullable: true},
+	}, nil)
+
+	loc := filepath.ToSlash(s.T().TempDir())
+	factory, _ := s.createWriterFactory(loc, arrSchema, 1024*1024)
+	defer factory.closeAll()
+	factory.format = failingOpenFormat{FileFormat: factory.format}
+
+	outputCh := make(chan iceberg.DataFile, 10)
+	writer := factory.newRollingDataWriter(s.ctx, "", nil, outputCh)
+
+	record := s.buildRecord(arrSchema, 3)
+	defer record.Release()
+
+	s.Require().NoError(writer.Add(record))
+	writer.wg.Wait()
+
+	err := writer.Add(record)
+	s.Require().Error(err)
+	s.NotErrorIs(err, ErrWriterClosed)
+	s.ErrorContains(err, "simulated open failure")
+}
+
 func (s *RollingDataWriterTestSuite) TestStreamErrorRemovesWriterFromFactory() {
 	writerSchema := arrow.NewSchema([]arrow.Field{
 		{Name: "id", Type: arrow.PrimitiveTypes.Int32, Nullable: true},
