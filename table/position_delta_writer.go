@@ -218,17 +218,15 @@ func (w *PositionDeltaWriter) Close(ctx context.Context) ([]iceberg.DataFile, er
 // iterator. Reinsert batches already have _row_id; insert batches get a null
 // _row_id column appended.
 //
-// Releases are owned by [WriteRecords]'s releasing wrapper: each batch yielded
-// here will be released exactly once by the consumer, on both the success and
-// the early-stop paths. Releasing again here would drive Arrow's refcount
-// below zero (undefined behavior — happy-path tests don't catch it; any IO
-// error mid-write would silently corrupt the allocator).
+// The iterator keeps ownership of what it yields, as [WriteRecords] expects:
+// staged batches stay owned by the writer until [PositionDeltaWriter.Close]
+// releases them, and each enriched insert batch is released once its yield
+// returns.
 func (w *PositionDeltaWriter) buildUnifiedIterator() iter.Seq2[arrow.RecordBatch, error] {
 	return func(yield func(arrow.RecordBatch, error) bool) {
 		alloc := memory.NewGoAllocator()
 
 		for _, batch := range w.reinsertBatches {
-			batch.Retain()
 			if !yield(batch, nil) {
 				return
 			}
@@ -241,7 +239,9 @@ func (w *PositionDeltaWriter) buildUnifiedIterator() iter.Seq2[arrow.RecordBatch
 
 				return
 			}
-			if !yield(enriched, nil) {
+			more := yield(enriched, nil)
+			enriched.Release()
+			if !more {
 				return
 			}
 		}

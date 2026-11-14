@@ -152,9 +152,9 @@ func WithPreserveRowLineage(schema *iceberg.Schema) WriteRecordOption {
 // field type. When the table uses microsecond timestamps, Arrow nanosecond
 // timestamps are also accepted and are downcast during the write path.
 //
-// WriteRecords releases each RecordBatch it consumes. If the caller needs a
-// batch to remain valid after it has been yielded, it must call Retain before
-// yielding and is then responsible for the corresponding Release.
+// WriteRecords does not release the record batches it consumes: the caller
+// keeps ownership of every batch it yields and releases it as usual. A batch
+// may be released or reused once the yield that produced it returns.
 func WriteRecords(ctx context.Context, tbl *Table,
 	schema *arrow.Schema,
 	records iter.Seq2[arrow.RecordBatch, error],
@@ -229,25 +229,9 @@ func WriteRecords(ctx context.Context, tbl *Table,
 		meta.props[ParquetRowGroupLimitKey] = strconv.Itoa(cfg.parquetRowGroupLimit)
 	}
 
-	releasing := func(yield func(arrow.RecordBatch, error) bool) {
-		for rec, err := range records {
-			if err != nil {
-				yield(nil, err)
-
-				return
-			}
-			if !yield(rec, nil) {
-				rec.Release()
-
-				return
-			}
-			rec.Release()
-		}
-	}
-
 	args := recordWritingArgs{
 		sc:                    schema,
-		itr:                   releasing,
+		itr:                   records,
 		fs:                    writeFS,
 		writeUUID:             cfg.writeUUID,
 		maxWriteWorkers:       cfg.maxWriteWorkers,

@@ -563,7 +563,7 @@ func ExecuteCompactionGroup(ctx context.Context, tbl *Table, group CompactionTas
 		newFiles   []iceberg.DataFile
 		bytesAfter int64
 	)
-	for df, err := range WriteRecords(ctx, tbl, arrowSchema, records, writeOpts...) {
+	for df, err := range WriteRecords(ctx, tbl, arrowSchema, releaseAfterYield(records), writeOpts...) {
 		if err != nil {
 			return CompactionGroupResult{
 				PartitionKey: group.PartitionKey,
@@ -589,6 +589,25 @@ func ExecuteCompactionGroup(ctx context.Context, tbl *Table, group CompactionTas
 		BytesBefore:         group.TotalSizeBytes,
 		BytesAfter:          bytesAfter,
 	}, nil
+}
+
+// releaseAfterYield releases each batch of records once its consumer's yield
+// returns, for record iterators whose batches the consumer owns.
+func releaseAfterYield(records iter.Seq2[arrow.RecordBatch, error]) iter.Seq2[arrow.RecordBatch, error] {
+	return func(yield func(arrow.RecordBatch, error) bool) {
+		for rec, err := range records {
+			if err != nil {
+				yield(nil, err)
+
+				return
+			}
+			more := yield(rec, nil)
+			rec.Release()
+			if !more {
+				return
+			}
+		}
+	}
 }
 
 // allTasksHaveRowLineage returns true iff every task in the group has a

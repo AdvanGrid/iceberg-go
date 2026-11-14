@@ -64,12 +64,12 @@ type producerImpl interface {
 	needsValidation() bool
 }
 
-// supersededAccumulator marks a producer that writes merged manifests OCC
-// retries orphan. Only rewrite implements it.
+// supersededAccumulator marks a producer that writes manifests the committed
+// snapshot may not reference: merged manifests OCC retries orphan, and for
+// merge-append the new-files manifest a merge folded into a larger one.
 type supersededAccumulator interface {
-	// supersededManifests returns paths of merged manifests to delete once the
-	// commit resolves. When committed is false the commit never landed, so the
-	// final attempt's manifests are orphaned too and are included.
+	// supersededManifests returns paths of manifests to delete once the
+	// commit resolves. committed is false when the commit never landed.
 	supersededManifests(committed bool) []string
 }
 
@@ -657,6 +657,14 @@ type mergeAppendFiles struct {
 	minCountToMerge  int
 	mergeEnabled     bool
 	mergeConcurrency int
+
+	// written holds every manifest this producer wrote across passes: the
+	// new-files manifests and the merged manifests of each pass.
+	written map[string]struct{}
+	// firstWritten is written after the first pass. firstOutput and
+	// lastOutput are the written manifests the first and the latest pass
+	// reference.
+	firstWritten, firstOutput, lastOutput map[string]struct{}
 }
 
 func newMergeAppendFilesProducer(op Operation, txn *Transaction, fs iceio.WriteFileIO, commitUUID *uuid.UUID, snapshotProps iceberg.Properties) *snapshotProducer {
@@ -695,8 +703,60 @@ func (m *mergeAppendFiles) processManifests(manifests []iceberg.ManifestFile) ([
 	if err != nil {
 		return nil, err
 	}
+	result = append(result, unmergedDeleteManifests...)
+	m.record(manifests, result)
 
-	return append(result, unmergedDeleteManifests...), nil
+	return result, nil
+}
+
+// record notes the manifests this producer wrote for one pass: its own
+// inputs (the new-files manifests) and its merged outputs.
+func (m *mergeAppendFiles) record(input, output []iceberg.ManifestFile) {
+	own := func(mf iceberg.ManifestFile) bool { return mf.SnapshotID() == m.base.snapshotID }
+	if m.written == nil {
+		m.written = map[string]struct{}{}
+	}
+	for _, mf := range input {
+		if own(mf) {
+			m.written[mf.FilePath()] = struct{}{}
+		}
+	}
+
+	referenced := map[string]struct{}{}
+	for _, mf := range output {
+		if own(mf) {
+			m.written[mf.FilePath()] = struct{}{}
+			referenced[mf.FilePath()] = struct{}{}
+		}
+	}
+	m.lastOutput = referenced
+	if m.firstWritten == nil {
+		m.firstWritten = maps.Clone(m.written)
+		m.firstOutput = referenced
+	}
+}
+
+// supersededManifests returns the manifests this producer wrote that the
+// committed snapshot does not reference, such as the new-files manifest a
+// merge folded into a larger one. The committed snapshot is the first pass's
+// or the latest pass's, so on success the outputs of both are kept. When the
+// commit never landed the transaction may commit its first pass again, so
+// everything the first pass wrote is kept.
+func (m *mergeAppendFiles) supersededManifests(committed bool) []string {
+	keep := m.firstWritten
+	if committed {
+		keep = maps.Clone(m.firstOutput)
+		maps.Copy(keep, m.lastOutput)
+	}
+
+	var paths []string
+	for path := range m.written {
+		if _, ok := keep[path]; !ok {
+			paths = append(paths, path)
+		}
+	}
+
+	return paths
 }
 
 func (m *mergeAppendFiles) needsValidation() bool { return false }
@@ -1749,8 +1809,9 @@ func (sp *snapshotProducer) commitManifests(newManifests, addedContent []iceberg
 	addSnap := NewAddSnapshotUpdate(&snapshot)
 	addSnap.ownManifests = addedContent
 	addSnap.rebuildManifestList = rebuildFn
-	// Hold the producer so doCommit can read the manifests orphaned by OCC
-	// retries and clean them up. Only rewrite producers implement this.
+	// Hold the producer so doCommit can read the manifests the committed
+	// snapshot does not reference and clean them up. Rewrite and merge-append
+	// producers implement this.
 	if acc, ok := sp.producerImpl.(supersededAccumulator); ok {
 		addSnap.supersededSource = acc
 	}

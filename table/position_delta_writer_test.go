@@ -208,6 +208,29 @@ func planFilesAll(ctx context.Context, tbl *table.Table) ([]iceberg.DataFile, er
 	return files, nil
 }
 
+// TestPositionDeltaWriter_CloseReleasesStagedBatches verifies that Close
+// releases every batch the writer staged or built, so once the caller releases
+// its own batches no Arrow memory remains.
+func TestPositionDeltaWriter_CloseReleasesStagedBatches(t *testing.T) {
+	mem := memory.NewCheckedAllocator(memory.DefaultAllocator)
+	defer mem.AssertSize(t, 0)
+
+	w, err := table.NewPositionDeltaWriter(newV3RowLineageTestTable(t))
+	require.NoError(t, err)
+
+	reinsertBatch := buildReinsertBatch(mem, []int64{1}, []string{"a"}, []int64{1 << 40})
+	defer reinsertBatch.Release()
+	require.NoError(t, w.Reinsert(reinsertBatch))
+
+	insertBatch := buildInsertBatch(mem, []int64{2}, []string{"b"})
+	defer insertBatch.Release()
+	require.NoError(t, w.Insert(insertBatch))
+
+	dataFiles, err := w.Close(context.Background())
+	require.NoError(t, err)
+	require.NotEmpty(t, dataFiles)
+}
+
 func TestPositionDeltaWriter_RequiresV3(t *testing.T) {
 	tbl := newV3RowLineageTestTable(t)
 	// newV3RowLineageTestTable already creates a v3 table, so this should succeed.

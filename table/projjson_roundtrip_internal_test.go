@@ -72,6 +72,7 @@ func TestWriteRecordsRecoversExactProjJSONCRSOnRead(t *testing.T) {
 			{"geom": "01010000000000000000003e400000000000002440"}
 		]`))
 		require.NoError(t, err)
+		defer rec.Release()
 		yield(rec, nil)
 	}
 
