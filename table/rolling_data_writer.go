@@ -77,6 +77,12 @@ type writerFactory struct {
 	equalityFieldIDs []int
 	sortKeys         []compute.SortKey
 
+	// sortOrderID is claimed for every file, and sortCmp checks the claim
+	// as rows arrive. Both are unset when rows ordered by the sort keys
+	// are not always in the declared order (see checkMergeableSortOrder).
+	sortOrderID int
+	sortCmp     *sortComparer
+
 	// Variant shredding: per-file inference over the first shredBufferRows rows.
 	shredEnabled    bool
 	shredBufferRows int
@@ -260,6 +266,15 @@ func newWriterFactory(rootLocation string, args recordWritingArgs, meta *Metadat
 
 			return nil, err
 		}
+		if checkMergeableSortOrder(*sortOrder) == nil {
+			f.sortCmp, err = newSortComparer(*sortOrder, f.fileSchema, f.arrowSchema)
+			if err != nil {
+				stopCount()
+
+				return nil, err
+			}
+			f.sortOrderID = sortOrder.OrderID()
+		}
 	}
 
 	// Shred top-level variant columns on data writes only.
@@ -303,7 +318,7 @@ func (w *writerFactory) openFileWriter(ctx context.Context, partitionPath string
 		filePath = w.locProvider.NewDataLocation(fileName)
 	}
 
-	// No SortOrderID: batches are sorted only individually (see resolveSortKeys).
+	// The sort order claim holds until the stream sees a row out of order.
 	// FileSchema stays logical; only arrowSchema carries the shredded layout.
 	return w.format.NewFileWriter(ctx, w.fs, partitionValues, tblutils.WriteFileInfo{
 		FileSchema:       w.fileSchema,
@@ -316,6 +331,7 @@ func (w *writerFactory) openFileWriter(ctx context.Context, partitionPath string
 		Spec:             w.currentSpec,
 		Content:          w.content,
 		EqualityFieldIDs: w.equalityFieldIDs,
+		SortOrderID:      w.sortOrderID,
 	}, arrowSchema)
 }
 
@@ -459,6 +475,16 @@ func (r *RollingDataWriter) stream(outputDataFilesCh chan<- iceberg.DataFile) {
 	var currentWriter tblutils.FileWriter
 	var fileArrowSchema *arrow.Schema // per-file shredded schema; nil => factory default
 
+	// lastRow is a copy of the last row written to the current file, the
+	// row the next batch must not sort before for the file to stay in order.
+	var lastRow arrow.RecordBatch
+	resetLastRow := func() {
+		if lastRow != nil {
+			lastRow.Release()
+			lastRow = nil
+		}
+	}
+
 	// Set only when stream reaches the end of its input and finalizes without
 	// error. The cleanup defer uses it to skip cancelling ctx on the success
 	// path — cancellation is an error-exit signal that unblocks parked senders,
@@ -497,6 +523,7 @@ func (r *RollingDataWriter) stream(outputDataFilesCh chan<- iceberg.DataFile) {
 			}
 		}
 		releaseBuf()
+		resetLastRow()
 		if currentWriter != nil {
 			_ = currentWriter.Abort()
 		}
@@ -535,6 +562,7 @@ func (r *RollingDataWriter) stream(outputDataFilesCh chan<- iceberg.DataFile) {
 		}
 		df, err := currentWriter.Close()
 		currentWriter = nil
+		resetLastRow()
 		fileArrowSchema = nil
 		bootstrapping = r.factory.shredEnabled // next file re-bootstraps
 		if err != nil {
@@ -552,6 +580,28 @@ func (r *RollingDataWriter) stream(outputDataFilesCh chan<- iceberg.DataFile) {
 			r.ctx, r.partitionKey, r.partitionValues, r.partitionID, fileCount, fileArrowSchema)
 
 		return err
+	}
+
+	// trackOrder drops the current file's sort order claim when sorted, a
+	// batch sorted on its own, starts before the file's last row.
+	trackOrder := func(sorted arrow.RecordBatch) error {
+		n := sorted.NumRows()
+		if r.factory.sortCmp == nil || n == 0 {
+			return nil
+		}
+		if lastRow != nil && r.factory.sortCmp.compare(lastRow, 0, sorted, 0) > 0 {
+			currentWriter.DropSortOrder()
+		}
+		tail := sorted.NewSlice(n-1, n)
+		defer tail.Release()
+		last, err := concatRecords(alloc, []arrow.RecordBatch{tail})
+		if err != nil {
+			return err
+		}
+		resetLastRow()
+		lastRow = last
+
+		return nil
 	}
 
 	// writeConverted owns converted: shred -> sort -> Write -> roll. allowRoll is
@@ -576,6 +626,12 @@ func (r *RollingDataWriter) stream(outputDataFilesCh chan<- iceberg.DataFile) {
 				return err
 			}
 			converted = sorted
+		}
+
+		if err := trackOrder(converted); err != nil {
+			converted.Release()
+
+			return err
 		}
 
 		err := currentWriter.Write(converted)
