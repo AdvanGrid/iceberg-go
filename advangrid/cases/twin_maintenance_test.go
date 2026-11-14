@@ -136,13 +136,14 @@ func runTwinMaintenance(t *testing.T, mode string) {
 
 	goBefore, javaBefore = goAfter, javaAfter
 	// Spark's procedure refuses an age under 24 hours; only its action API
-	// accepts less. Both twins have no unreferenced objects here, so age 0
+	// accepts less. Prefix listing lists through S3FileIO; the default lists
+	// through Hadoop, which has no s3 file system in the oracle. Both twins have no unreferenced objects here, so age 0
 	// and 24 hours delete the same files: none.
 	require.Empty(t, unreferenced(goBefore), "iceberg-go twin")
 	require.Empty(t, unreferenced(javaBefore), "spark twin")
 	_, err = tw.Go.DeleteOrphanFiles(ctx, table.WithFilesOlderThan(0))
 	require.NoError(t, err)
-	tw.spark(t, "CALL lake.system.remove_orphan_files(table => '%s', older_than => %s)",
+	tw.spark(t, "CALL lake.system.remove_orphan_files(table => '%s', older_than => %s, prefix_listing => true)",
 		sparkName(tw.Java), sparkTimestamp(time.Now().Add(-24*time.Hour)))
 	tw.reload(t)
 	tw.requireSameContent(t, model, "orphan removal")
