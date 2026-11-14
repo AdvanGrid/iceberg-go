@@ -104,6 +104,7 @@ func (s *WriteRecordsTestSuite) TestBasicWrite() {
 
 	records := func(yield func(arrow.RecordBatch, error) bool) {
 		rec := s.buildRecords(schema, 10)
+		defer rec.Release()
 		yield(rec, nil)
 	}
 
@@ -224,6 +225,7 @@ func (s *WriteRecordsTestSuite) TestWriteRecordsResolvesProjJSONCRSFromTableProp
 			{"geom": "01010000000000000000003e400000000000002440"}
 		]`))
 		s.Require().NoError(err)
+		defer rec.Release()
 		yield(rec, nil)
 	}
 
@@ -323,7 +325,9 @@ func (s *WriteRecordsTestSuite) TestSmallTargetFileSizeProducesMultipleFiles() {
 	records := func(yield func(arrow.RecordBatch, error) bool) {
 		for range 10 {
 			rec := s.buildRecords(schema, 100)
-			if !yield(rec, nil) {
+			more := yield(rec, nil)
+			rec.Release()
+			if !more {
 				return
 			}
 		}
@@ -377,6 +381,7 @@ func (s *WriteRecordsTestSuite) TestEarlyStopCancelsRecordProduction() {
 					produced.Add(1)
 					record := s.buildRecords(schema, 100)
 					accepted := yield(record, nil)
+					record.Release()
 					if !accepted {
 						return
 					}
@@ -406,6 +411,7 @@ func (s *WriteRecordsTestSuite) TestWithWriteUUID() {
 	writeID := uuid.New()
 	records := func(yield func(arrow.RecordBatch, error) bool) {
 		rec := s.buildRecords(schema, 5)
+		defer rec.Release()
 		yield(rec, nil)
 	}
 
@@ -547,7 +553,9 @@ func (s *WriteRecordsTestSuite) TestTimestampNanosecondsShouldFloorNegativeValue
 		bldr.Field(0).(*array.Int32Builder).Append(1)
 		bldr.Field(1).(*array.TimestampBuilder).Append(arrow.Timestamp(-1_500))
 
-		yield(bldr.NewRecordBatch(), nil)
+		rec := bldr.NewRecordBatch()
+		defer rec.Release()
+		yield(rec, nil)
 	}
 
 	var dataFiles []iceberg.DataFile
