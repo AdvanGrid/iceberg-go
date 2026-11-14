@@ -243,7 +243,9 @@ func (l *Lake) Checksums(t testing.TB, tbl *table.Table, snapshotID int64) Check
 	name := QualifiedName(tbl)
 	sc := tbl.Schema()
 
-	var opts []table.ScanOption
+	// Four concurrent files keep a full-size scan's memory bounded; the
+	// default (GOMAXPROCS) held over 20 GB on the 240M-row table.
+	opts := []table.ScanOption{table.WithMaxConcurrency(4)}
 	if snapshotID != 0 {
 		opts = append(opts, table.WithSnapshotID(snapshotID))
 	}
