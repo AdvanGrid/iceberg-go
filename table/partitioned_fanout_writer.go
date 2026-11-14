@@ -175,9 +175,10 @@ func (p *partitionedFanoutWriter) Write(ctx context.Context, workers int) iter.S
 	}
 	startRecordFeeder(fanoutCtx, p.itr, fanoutWorkers, inputRecordsCh)
 
+	order := newRecordOrder()
 	for range workers {
 		fanoutWorkers.Go(func() error {
-			return p.fanout(fanoutCtx, writerCtx, inputRecordsCh, outputDataFilesCh)
+			return p.fanout(fanoutCtx, writerCtx, inputRecordsCh, order, outputDataFilesCh)
 		})
 	}
 
@@ -207,63 +208,137 @@ func startRecordFeeder(ctx context.Context, itr iter.Seq2[arrow.RecordBatch, err
 	})
 }
 
-func (p *partitionedFanoutWriter) fanout(ctx context.Context, writerCtx context.Context, inputRecordsCh <-chan arrow.RecordBatch, dataFilesChannel chan<- iceberg.DataFile) error {
+// recordTurn orders one record's writes after the previous record's: the
+// worker holding the record waits for prev to close before adding its
+// partitions to the rolling data writers, and closes done when it is finished.
+type recordTurn struct {
+	prev <-chan struct{}
+	done chan struct{}
+}
+
+// recordOrder hands out a recordTurn with every record taken from the input
+// channel, so that workers partition records concurrently but add them to the
+// rolling data writers in input order. This keeps each partition's rows in
+// the order they arrived.
+type recordOrder struct {
+	mu   sync.Mutex
+	last chan struct{}
+}
+
+func newRecordOrder() *recordOrder {
+	last := make(chan struct{})
+	close(last)
+
+	return &recordOrder{last: last}
+}
+
+// receive takes the next record from inputRecordsCh together with its turn.
+// ok is false once the channel is closed.
+func (o *recordOrder) receive(ctx context.Context, inputRecordsCh <-chan arrow.RecordBatch) (record arrow.RecordBatch, turn recordTurn, ok bool, err error) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+
+	select {
+	case <-ctx.Done():
+		return nil, recordTurn{}, false, context.Cause(ctx)
+	case record, ok = <-inputRecordsCh:
+		if !ok {
+			return nil, recordTurn{}, false, nil
+		}
+		turn = recordTurn{prev: o.last, done: make(chan struct{})}
+		o.last = turn.done
+
+		return record, turn, true, nil
+	}
+}
+
+func (p *partitionedFanoutWriter) fanout(ctx context.Context, writerCtx context.Context, inputRecordsCh <-chan arrow.RecordBatch, order *recordOrder, dataFilesChannel chan<- iceberg.DataFile) error {
 	for {
-		select {
-		case <-ctx.Done():
-			return context.Cause(ctx)
+		record, turn, ok, err := order.receive(ctx, inputRecordsCh)
+		if err != nil || !ok {
+			return err
+		}
 
-		case record, ok := <-inputRecordsCh:
-			if !ok {
-				return nil
-			}
-
-			if err := p.processRecord(ctx, writerCtx, record, dataFilesChannel); err != nil {
-				return err
-			}
+		if err := p.processRecord(ctx, writerCtx, record, turn, dataFilesChannel); err != nil {
+			return err
 		}
 	}
 }
 
-// processRecord partitions a single record batch and writes sub-batches to
-// the appropriate rolling data writers. The record is released when this
-// function returns, bounding Arrow memory to one batch per fanout worker.
-func (p *partitionedFanoutWriter) processRecord(ctx context.Context, writerCtx context.Context, record arrow.RecordBatch, dataFilesChannel chan<- iceberg.DataFile) error {
-	defer record.Release()
+// partitionedRecord is one partition's rows of a record batch.
+type partitionedRecord struct {
+	record          arrow.RecordBatch
+	path            string
+	partitionValues map[int]any
+}
 
-	partitions, err := p.getPartitions(record)
+// processRecord partitions a single record batch and, once the previous
+// record's turn is done, writes the sub-batches to the appropriate rolling
+// data writers. The record is released once partitioned and its sub-batches
+// when this function returns, bounding Arrow memory to one batch per fanout
+// worker.
+func (p *partitionedFanoutWriter) processRecord(ctx context.Context, writerCtx context.Context, record arrow.RecordBatch, turn recordTurn, dataFilesChannel chan<- iceberg.DataFile) error {
+	defer close(turn.done)
+
+	parts, err := p.partitionRecord(ctx, record)
+	defer func() {
+		for _, part := range parts {
+			part.record.Release()
+		}
+	}()
 	if err != nil {
 		return err
 	}
 
+	select {
+	case <-ctx.Done():
+		return context.Cause(ctx)
+	case <-turn.prev:
+	}
+
+	for _, part := range parts {
+		rollingDataWriter, err := p.writerFactory.getOrCreateRollingDataWriter(writerCtx, part.path, part.partitionValues, dataFilesChannel)
+		if err != nil {
+			return err
+		}
+		if err := rollingDataWriter.Add(part.record); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// partitionRecord splits a record batch into one record per partition and
+// releases the input record.
+func (p *partitionedFanoutWriter) partitionRecord(ctx context.Context, record arrow.RecordBatch) ([]partitionedRecord, error) {
+	defer record.Release()
+
+	partitions, err := p.getPartitions(record)
+	if err != nil {
+		return nil, err
+	}
+
+	parts := make([]partitionedRecord, 0, len(partitions))
 	for _, val := range partitions {
 		select {
 		case <-ctx.Done():
-			return context.Cause(ctx)
+			return parts, context.Cause(ctx)
 		default:
 		}
 
 		partitionRecord, err := partitionBatchByKey(ctx)(record, val.rows)
 		if err != nil {
-			return err
+			return parts, err
 		}
-
-		partitionPath := p.partitionPath(val.partitionRec)
-		rollingDataWriter, err := p.writerFactory.getOrCreateRollingDataWriter(writerCtx, partitionPath, val.partitionValues, dataFilesChannel)
-		if err != nil {
-			partitionRecord.Release()
-
-			return err
-		}
-
-		addErr := rollingDataWriter.Add(partitionRecord)
-		partitionRecord.Release()
-		if addErr != nil {
-			return addErr
-		}
+		parts = append(parts, partitionedRecord{
+			record:          partitionRecord,
+			path:            p.partitionPath(val.partitionRec),
+			partitionValues: val.partitionValues,
+		})
 	}
 
-	return nil
+	return parts, nil
 }
 
 func (p *partitionedFanoutWriter) yieldDataFiles(fanoutWorkers *errgroup.Group, inputRecordsCh <-chan arrow.RecordBatch, outputDataFilesCh chan iceberg.DataFile, cancel context.CancelFunc) iter.Seq2[iceberg.DataFile, error] {
