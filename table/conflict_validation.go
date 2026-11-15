@@ -172,9 +172,11 @@ var (
 //
 // The metadata and concurrent-snapshot walk are fixed once constructed — do
 // NOT reuse the same context across retry attempts that re-fetch catalog
-// state, because both the walk and its read caches would become stale. There
-// is deliberately no Refresh or mutator method; a refresh must flow as a
-// fresh call to newConflictContext(newBase, newCurrent, ...).
+// state, because the walk would become stale. There is deliberately no
+// Refresh method; a refresh must flow as a fresh call to
+// newConflictContext(newBase, newCurrent, ...). The read caches hold
+// immutable manifest lists and manifests, so a retry's context takes them
+// over from the attempt before with sharingReadsOf.
 type conflictContext struct {
 	current       Metadata
 	branch        string
@@ -184,10 +186,9 @@ type conflictContext struct {
 	// Resolved once; subsequent validator calls reuse the walk.
 	concurrent []Snapshot
 
-	// Lazily caches raw manifest bytes for this validation attempt. The
-	// cache is intentionally scoped to the context because all validators
-	// inspect the same immutable metadata snapshot, while ManifestFile.Entries
-	// still performs descriptor-specific inheritance for each logical read.
+	// Lazily caches raw manifest bytes for the validators of a commit.
+	// Committed manifests are immutable, while ManifestFile.Entries still
+	// performs descriptor-specific inheritance for each logical read.
 	manifestIO *conflictManifestIO
 
 	// Parsed manifest-list descriptors are also shared across validators.
@@ -195,6 +196,7 @@ type conflictContext struct {
 }
 
 type conflictManifestList struct {
+	path      string
 	manifests []iceberg.ManifestFile
 	err       error
 }
@@ -392,14 +394,30 @@ func (c *conflictContext) manifestsFor(snap Snapshot) ([]iceberg.ManifestFile, e
 	if c.manifestLists == nil {
 		c.manifestLists = make(map[int64]conflictManifestList)
 	}
-	if cached, ok := c.manifestLists[snap.SnapshotID]; ok {
+	if cached, ok := c.manifestLists[snap.SnapshotID]; ok && cached.path == snap.ManifestList {
 		return cached.manifests, cached.err
 	}
 
 	manifests, err := snap.Manifests(c.fs)
-	c.manifestLists[snap.SnapshotID] = conflictManifestList{manifests: manifests, err: err}
+	c.manifestLists[snap.SnapshotID] = conflictManifestList{path: snap.ManifestList, manifests: manifests, err: err}
 
 	return manifests, err
+}
+
+// sharingReadsOf makes c reuse the manifest lists and manifests prev, the
+// context of an earlier attempt of the same commit, has read, so that a retry
+// reads only those of the snapshots committed since. It returns c.
+func (c *conflictContext) sharingReadsOf(prev *conflictContext) *conflictContext {
+	if prev == nil {
+		return c
+	}
+	c.manifestIO = prev.manifestReadIO()
+	if prev.manifestLists == nil {
+		prev.manifestLists = make(map[int64]conflictManifestList)
+	}
+	c.manifestLists = prev.manifestLists
+
+	return c
 }
 
 // newConflictContext builds a validation context for the given
@@ -473,7 +491,10 @@ func newConflictContext(base, current Metadata, branch string, fs iceio.IO, case
 // into a newer manifest whose added-snapshot-id is the committing
 // one, so per-manifest filtering alone would miss or mis-attribute
 // entries. Filtering on entry.SnapshotID() is the only attribution
-// that survives manifest rewrites.
+// that survives manifest rewrites. As in Java's validationHistory, only
+// the manifests snap wrote are read: they hold every entry snap added,
+// and skipping the manifests it inherited keeps a retry from reading
+// the whole table again.
 //
 // The visitor returns early if the callback returns a non-nil error.
 func (c *conflictContext) forEachAddedEntry(content iceberg.ManifestContent, visit func(Snapshot, iceberg.ManifestEntry) error) error {
@@ -484,6 +505,9 @@ func (c *conflictContext) forEachAddedEntry(content iceberg.ManifestContent, vis
 		}
 		for _, mf := range manifests {
 			if content >= 0 && mf.ManifestContent() != content {
+				continue
+			}
+			if mf.SnapshotID() != snap.SnapshotID {
 				continue
 			}
 
@@ -596,8 +620,9 @@ func validateDataFilesExist(ctx *conflictContext, referencedPaths []string) erro
 // partition is rejected before the commit overwrites it.
 //
 // The check runs in three layers:
-//  1. A manifest-level partition-summary evaluator prunes manifests
-//     whose summaries cannot overlap the filter.
+//  1. Only manifests the concurrent snapshot wrote are considered, and
+//     a manifest-level partition-summary evaluator prunes those whose
+//     summaries cannot overlap the filter.
 //  2. Inside surviving manifests, every ADDED entry attributed to the
 //     concurrent snapshot is evaluated against a per-spec partition
 //     evaluator on its partition tuple, so a manifest whose summary
@@ -644,7 +669,7 @@ func validateAddedDataFilesMatchingFilter(ctx *conflictContext, filter iceberg.B
 			return fmt.Errorf("loading manifests for concurrent snapshot %d: %w", snap.SnapshotID, err)
 		}
 		for _, mf := range manifests {
-			if mf.ManifestContent() != iceberg.ManifestContentData {
+			if mf.ManifestContent() != iceberg.ManifestContentData || mf.SnapshotID() != snap.SnapshotID {
 				continue
 			}
 

@@ -24,6 +24,8 @@ const (
 	snapshotAge    = time.Minute
 	orphanAge      = 2 * time.Minute
 	maintenanceGap = 2 * time.Second
+	// objectStoreLatency is a typical S3 time to first byte.
+	objectStoreLatency = 25 * time.Millisecond
 )
 
 func dayPartitioned() catalog.CreateTableOpt {
@@ -85,44 +87,75 @@ func (w *concurrentWriter) rows(n, day int) []lane.Row {
 	return rows
 }
 
-// run appends to and overwrites its days for at least d, so that the first
-// snapshots outlive snapshotAge while the writers still run.
-func (w *concurrentWriter) run(ctx context.Context, d time.Duration) error {
+// run appends to and overwrites its days every few seconds for at least d,
+// so that the first snapshots outlive snapshotAge while the writers still run.
+// It returns how long each overwrite took, retries included.
+func (w *concurrentWriter) run(ctx context.Context, d time.Duration) ([]time.Duration, error) {
+	var overwrites []time.Duration
 	start := time.Now()
 	for round := 0; round < len(w.days) || time.Since(start) < d; round++ {
-		// Each writer commits every few seconds: an overwrite retry re-reads
-		// every manifest of the fresh head (AdvanGrid/advangrid#2654), so a
-		// peer committing faster than that starves it.
 		time.Sleep(time.Duration(2000+w.gen.Rand.IntN(3000)) * time.Millisecond)
 		tbl, err := w.cat.LoadTable(ctx, w.ident)
 		if err != nil {
-			return fmt.Errorf("round %d load: %w", round, err)
+			return overwrites, fmt.Errorf("round %d load: %w", round, err)
 		}
 		day := w.days[round%len(w.days)]
 		if round < len(w.days) || w.gen.Rand.IntN(2) == 0 {
-			rows := w.rows(200+w.gen.Rand.IntN(300), day)
-			rdr := lane.Reader(rows, 4096)
-			_, err = tbl.Append(ctx, rdr, nil)
-			rdr.Release()
-			if err != nil {
-				return fmt.Errorf("round %d append day %d: %w", round, day, err)
+			if err := w.append(ctx, tbl, day); err != nil {
+				return overwrites, fmt.Errorf("round %d append day %d: %w", round, day, err)
 			}
-			w.model.Put(rows)
 
 			continue
 		}
 		rows := w.rows(w.gen.Rand.IntN(200), day)
 		rdr := lane.Reader(rows, 4096)
+		began := time.Now()
 		_, err = tbl.Overwrite(ctx, rdr, nil, table.WithOverwriteFilter(dayFilter(day)))
 		rdr.Release()
 		if err != nil {
-			return fmt.Errorf("round %d overwrite day %d: %w", round, day, err)
+			return overwrites, fmt.Errorf("round %d overwrite day %d: %w", round, day, err)
 		}
+		overwrites = append(overwrites, time.Since(began))
 		w.model.DeleteWhere(inDay(day))
 		w.model.Put(rows)
 	}
 
+	return overwrites, nil
+}
+
+func (w *concurrentWriter) append(ctx context.Context, tbl *table.Table, day int) error {
+	rows := w.rows(200+w.gen.Rand.IntN(300), day)
+	rdr := lane.Reader(rows, 4096)
+	defer rdr.Release()
+	if _, err := tbl.Append(ctx, rdr, nil); err != nil {
+		return err
+	}
+	w.model.Put(rows)
+
 	return nil
+}
+
+// compete appends to its days about once a second until stop is closed, so
+// that every commit retry of the other writer meets a new branch head. It
+// returns the number of commits.
+func (w *concurrentWriter) compete(ctx context.Context, stop <-chan struct{}) (int, error) {
+	tick := time.NewTicker(time.Second)
+	defer tick.Stop()
+	for commits := 0; ; commits++ {
+		select {
+		case <-stop:
+			return commits, nil
+		case <-tick.C:
+		}
+		tbl, err := w.cat.LoadTable(ctx, w.ident)
+		if err != nil {
+			return commits, fmt.Errorf("commit %d load: %w", commits, err)
+		}
+		day := w.days[commits%len(w.days)]
+		if err := w.append(ctx, tbl, day); err != nil {
+			return commits, fmt.Errorf("commit %d append day %d: %w", commits, day, err)
+		}
+	}
 }
 
 // pausedAppend writes data files for day, hands their paths to written,
@@ -199,9 +232,12 @@ func maintain(ctx context.Context, cat catalog.Catalog, ident table.Identifier, 
 
 // TestConcurrentWritersAndMaintenance runs two writers on disjoint days and
 // a maintenance loop of expiry and orphan removal against one table at the
-// same time. Commit conflicts must retry and leave the union of the writers'
-// models, and orphan removal must keep the data files of a write that is in
-// flight and younger than the age threshold.
+// same time. One writer appends and overwrites every few seconds, the other
+// appends about once a second; both reach storage with an object store's
+// latency. Every overwrite must commit through its retries, the table must
+// hold the union of the writers' models, and orphan removal must keep the
+// data files of a write that is in flight and younger than the age
+// threshold.
 func TestConcurrentWritersAndMaintenance(t *testing.T) {
 	for _, mode := range lane.DeleteModes {
 		t.Run(mode, func(t *testing.T) {
@@ -213,7 +249,7 @@ func TestConcurrentWritersAndMaintenance(t *testing.T) {
 			writers := make([]*concurrentWriter, 2)
 			for i := range writers {
 				writers[i] = &concurrentWriter{
-					cat:   lane.Open(t).Catalog,
+					cat:   lane.CatalogVia(t, lane.LatencyProxy(t, objectStoreLatency)),
 					ident: ident,
 					days:  []int{i, i + 2, i + 4, i + 6},
 					gen:   lane.NewGen(uint64(10 + i)),
@@ -226,19 +262,24 @@ func TestConcurrentWritersAndMaintenance(t *testing.T) {
 			written := make(chan []string, 1)
 			resume := make(chan struct{})
 			stopMaintenance := make(chan struct{})
+			stopCompeting := make(chan struct{})
 			var wg sync.WaitGroup
+			var overwrites []time.Duration
+			var competing int
 			writerErrs := make([]error, len(writers))
-			for i, w := range writers {
-				wg.Go(func() {
-					writerErrs[i] = w.run(ctx, writeFor)
-					if writerErrs[i] == nil && i == 0 {
-						writerErrs[i] = w.pausedAppend(ctx, 8, written, resume)
-					}
-					if writerErrs[i] != nil && i == 0 {
-						close(written)
-					}
-				})
-			}
+			wg.Go(func() {
+				overwrites, writerErrs[0] = writers[0].run(ctx, writeFor)
+				close(stopCompeting)
+				if writerErrs[0] == nil {
+					writerErrs[0] = writers[0].pausedAppend(ctx, 8, written, resume)
+				}
+				if writerErrs[0] != nil {
+					close(written)
+				}
+			})
+			wg.Go(func() {
+				competing, writerErrs[1] = writers[1].compete(ctx, stopCompeting)
+			})
 			var maint maintenanceRun
 			var maintErr error
 			maintDone := make(chan struct{})
@@ -263,6 +304,8 @@ func TestConcurrentWritersAndMaintenance(t *testing.T) {
 			require.Empty(t, intersect(maint.deleted, inFlight), "maintenance deleted in-flight files")
 			require.Positive(t, maint.expired, "expiry must remove snapshots while the writers run")
 			t.Logf("maintenance passes %d, snapshots expired %d, orphans deleted %d", maint.passes, maint.expired, len(maint.deleted))
+			require.NotEmpty(t, overwrites, "the overwriting writer must overwrite")
+			t.Logf("overwrites %d, slowest %s; competing commits %d", len(overwrites), slices.Max(overwrites), competing)
 
 			tbl = lk.Reload(t, tbl)
 			model := lane.Model{}
