@@ -64,7 +64,7 @@ cd advangrid && go test -c -tags fullsize,duckdb_arrow -o /tmp/cases.test ./case
 cd cases && LANE_FULLSIZE_DIR=<archive>/parquet/gridlink_line /tmp/cases.test -test.run '^TestFullSize$' -test.v -test.timeout 24h
 ```
 
-On rootless podman, run the binary inside `spark-iceberg`'s network namespace (`podman unshare nsenter -t $(podman inspect -f '{{.State.Pid}}' spark-iceberg) -n ...`). Through the rootless port forwarding, long scans of this table had reads cut mid-body. The last passing run took 2h15m: backfill 53 min, then about 16 min per step, mostly the three checksums.
+On rootless podman, run the binary inside `spark-iceberg`'s network namespace (`podman unshare nsenter -t $(podman inspect -f '{{.State.Pid}}' spark-iceberg) -n ...`). Through the rootless port forwarding, long scans of this table had reads cut mid-body. Start the oracle and the run with `systemd-run --user` (the oracle as `podman start --attach` with `Restart=always`), so they outlive the shell that started them. The lane retries a Spark query while the oracle refuses connections, for up to 5 minutes. The last passing run took 2h15m: backfill 53 min, then about 16 min per step, mostly the three checksums.
 
 ## Fixes and upstream candidates
 

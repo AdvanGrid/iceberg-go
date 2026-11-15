@@ -3,10 +3,13 @@ package lane
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"strings"
+	"syscall"
+	"time"
 )
 
 const oracleURL = "http://localhost:8899/sql"
@@ -27,7 +30,7 @@ func (s *Spark) Query(ctx context.Context, query string) ([][]*string, error) {
 	if err != nil {
 		return nil, fmt.Errorf("Spark.Query - request: %w", err)
 	}
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := postWhileRefused(req)
 	if err != nil {
 		return nil, fmt.Errorf("Spark.Query - post: %w", err)
 	}
@@ -45,6 +48,33 @@ func (s *Spark) Query(ctx context.Context, query string) ([][]*string, error) {
 	}
 
 	return res.Rows, nil
+}
+
+// oracleRestartWait bounds how long a query waits for a restarting oracle.
+const oracleRestartWait = 5 * time.Minute
+
+// postWhileRefused sends req, retrying while the oracle refuses connections.
+// A refused connection means the statement never ran, so resending is safe;
+// the oracle restarts on its own when its Spark session dies.
+func postWhileRefused(req *http.Request) (*http.Response, error) {
+	deadline := time.Now().Add(oracleRestartWait)
+	for {
+		retry, err := req.GetBody()
+		if err != nil {
+			return nil, err
+		}
+		attempt := req.Clone(req.Context())
+		attempt.Body = retry
+		resp, err := http.DefaultClient.Do(attempt)
+		if err == nil || !errors.Is(err, syscall.ECONNREFUSED) || time.Now().After(deadline) {
+			return resp, err
+		}
+		select {
+		case <-req.Context().Done():
+			return nil, req.Context().Err()
+		case <-time.After(5 * time.Second):
+		}
+	}
 }
 
 // Row runs a query that returns exactly one row.
