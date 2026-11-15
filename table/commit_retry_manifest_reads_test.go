@@ -23,6 +23,7 @@ import (
 	"maps"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -87,6 +88,10 @@ type retryReadsScenario struct {
 }
 
 func newRetryReadsScenario(t *testing.T) *retryReadsScenario {
+	return newRetryReadsScenarioV(t, 2)
+}
+
+func newRetryReadsScenarioV(t *testing.T, formatVersion int) *retryReadsScenario {
 	location := filepath.ToSlash(t.TempDir())
 	schema := iceberg.NewSchema(0,
 		iceberg.NestedField{ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int64},
@@ -94,7 +99,7 @@ func newRetryReadsScenario(t *testing.T) *retryReadsScenario {
 	)
 	meta, err := table.NewMetadata(schema, iceberg.UnpartitionedSpec, table.UnsortedSortOrder, location,
 		iceberg.Properties{
-			table.PropertyFormatVersion:        "2",
+			table.PropertyFormatVersion:        strconv.Itoa(formatVersion),
 			table.CommitMinRetryWaitMsKey:      "0",
 			table.CommitMaxRetryWaitMsKey:      "0",
 			table.CommitTotalRetryTimeoutMsKey: "60000",
@@ -257,4 +262,102 @@ func TestCommitRetryStillDetectsConflictingAppend(t *testing.T) {
 		return s.peerAddFile(current, `[{"id":4,"val":"p"}]`)
 	})
 	require.ErrorIs(t, err, table.ErrConflictingDataFiles)
+}
+
+// TestCommitRetryRebuildsStagedSiblingManifests checks that an overwrite
+// staged after appends in the same transaction carries the appends'
+// manifests and tombstones with the sequence numbers and row IDs of the
+// retry. The retry assigns the appends a new sequence number and row-ID
+// range, so what the overwrite learned of their manifests in an earlier
+// attempt must not be reused.
+func TestCommitRetryRebuildsStagedSiblingManifests(t *testing.T) {
+	for _, version := range []int{2, 3} {
+		t.Run(fmt.Sprintf("v%d", version), func(t *testing.T) {
+			s := newRetryReadsScenarioV(t, version)
+			cat := &occScenarioCatalog{
+				current:       s.base,
+				conflictsLeft: 1,
+				location:      s.location,
+				onConflict:    s.appendUnrelated,
+			}
+			tbl := table.New([]string{"default", "retry_reads"}, s.base, s.location+"/metadata/writer.metadata.json",
+				func(context.Context) (iceio.IO, error) { return iceio.LocalFS{}, nil }, cat)
+
+			tx := tbl.NewTransaction()
+			for _, rows := range []string{`[{"id":60,"val":"kept"}]`, `[{"id":2,"val":"overwritten"}]`} {
+				s.appendRows(tx, rows)
+			}
+			s.overwriteRows(tx, `[{"id":3,"val":"new"}]`)
+			_, err := tx.Commit(t.Context())
+			require.NoError(t, err)
+			require.Equal(t, int32(2), cat.commitTableCalls.Load())
+
+			head := cat.current.CurrentSnapshot()
+			parent := cat.current.SnapshotByID(*head.ParentSnapshotID)
+			require.NotNil(t, parent)
+			requireInheritedAsInParent(t, parent, head)
+		})
+	}
+}
+
+func (s *retryReadsScenario) appendRows(tx *table.Transaction, rows string) {
+	tbl, err := array.TableFromJSON(memory.DefaultAllocator, s.arrowSc, []string{rows})
+	require.NoError(s.t, err)
+	defer tbl.Release()
+	rdr := array.NewTableReader(tbl, -1)
+	defer rdr.Release()
+	require.NoError(s.t, tx.Append(s.t.Context(), rdr, nil))
+}
+
+func (s *retryReadsScenario) overwriteRows(tx *table.Transaction, rows string) {
+	tbl, err := array.TableFromJSON(memory.DefaultAllocator, s.arrowSc, []string{rows})
+	require.NoError(s.t, err)
+	defer tbl.Release()
+	rdr := array.NewTableReader(tbl, -1)
+	defer rdr.Release()
+	require.NoError(s.t, tx.Overwrite(s.t.Context(), rdr, nil, table.WithOverwriteFilter(overwrittenRows())))
+}
+
+// requireInheritedAsInParent checks that every manifest head kept from
+// parent has parent's manifest-list entry, and that every file head removed
+// keeps the sequence numbers it had in parent.
+func requireInheritedAsInParent(t *testing.T, parent, head *table.Snapshot) {
+	t.Helper()
+	fio := iceio.LocalFS{}
+	parentManifests, err := parent.Manifests(fio)
+	require.NoError(t, err)
+	type listEntry struct {
+		seq, minSeq int64
+		firstRowID  *int64
+	}
+	inParent := map[string]listEntry{}
+	type fileSeqs struct{ data, file int64 }
+	liveInParent := map[string]fileSeqs{}
+	for _, m := range parentManifests {
+		inParent[m.FilePath()] = listEntry{m.SequenceNum(), m.MinSequenceNum(), m.FirstRowID()}
+		for e, err := range m.Entries(fio, true) {
+			require.NoError(t, err)
+			liveInParent[e.DataFile().FilePath()] = fileSeqs{e.SequenceNum(), *e.FileSequenceNum()}
+		}
+	}
+
+	headManifests, err := head.Manifests(fio)
+	require.NoError(t, err)
+	removed := 0
+	for _, m := range headManifests {
+		if want, ok := inParent[m.FilePath()]; ok {
+			require.Equal(t, want, listEntry{m.SequenceNum(), m.MinSequenceNum(), m.FirstRowID()},
+				"manifest %s differs from its entry in the parent's manifest list", m.FilePath())
+		}
+		for e, err := range m.Entries(fio, false) {
+			require.NoError(t, err)
+			if e.Status() != iceberg.EntryStatusDELETED {
+				continue
+			}
+			removed++
+			require.Equal(t, liveInParent[e.DataFile().FilePath()], fileSeqs{e.SequenceNum(), *e.FileSequenceNum()},
+				"tombstone of %s", e.DataFile().FilePath())
+		}
+	}
+	require.Positive(t, removed)
 }
