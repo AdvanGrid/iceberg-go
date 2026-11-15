@@ -234,10 +234,10 @@ func maintain(ctx context.Context, cat catalog.Catalog, ident table.Identifier, 
 // a maintenance loop of expiry and orphan removal against one table at the
 // same time. One writer appends and overwrites every few seconds, the other
 // appends about once a second; both reach storage with an object store's
-// latency. Every overwrite must commit through the
-// retries, the table must hold the union of the writers' models, and orphan
-// removal must keep the data files of a write that is in flight and younger
-// than the age threshold.
+// latency. Every overwrite must commit through its retries, the table must
+// hold the union of the writers' models, and orphan removal must keep the
+// data files of a write that is in flight and younger than the age
+// threshold.
 func TestConcurrentWritersAndMaintenance(t *testing.T) {
 	for _, mode := range lane.DeleteModes {
 		t.Run(mode, func(t *testing.T) {

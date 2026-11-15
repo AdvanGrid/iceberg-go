@@ -803,10 +803,9 @@ type snapshotProducer struct {
 	deletedDVsByRef         map[string]iceberg.DataFile
 	snapshotProps           iceberg.Properties
 
-	// checkedManifests caches, by manifest path, which of the files this
-	// producer removes each manifest checkRemovedFiles read holds. Manifests
-	// are immutable, so an OCC retry reads only the manifests it has not
-	// checked yet.
+	// checkedManifests caches, by manifest path, the files this producer
+	// removes that each checked manifest holds. Manifests are immutable, so
+	// an OCC retry reads only the manifests it has not checked yet.
 	checkedManifests map[string]manifestRemovals
 }
 
