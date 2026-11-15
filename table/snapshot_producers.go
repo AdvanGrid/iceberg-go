@@ -149,6 +149,12 @@ type overwriteFiles struct {
 	// reject a concurrent append into the same partition, which is
 	// semantically compatible with a rewrite.
 	skipDefaultValidator bool
+
+	// filtered caches the result of filtering each inherited manifest, by
+	// manifest path, so an OCC retry reads and rewrites only the manifests
+	// it has not filtered yet. Java's ManifestFilterManager keeps the same
+	// cache across commit attempts.
+	filtered map[string]filteredManifest
 }
 
 type overwriteManifestScan struct {
@@ -156,10 +162,21 @@ type overwriteManifestScan struct {
 	deleted    []iceberg.ManifestEntry
 }
 
-type overwriteParentManifests struct {
-	existing  []iceberg.ManifestFile
+// filteredManifest is what an inherited manifest contributes to the new
+// snapshot: the manifest itself, its rewritten copy, or nothing when every
+// entry is removed, plus the entries this producer removed from it.
+type filteredManifest struct {
+	manifests []iceberg.ManifestFile
 	deleted   []iceberg.ManifestEntry
+}
+
+type overwriteParentManifests struct {
+	existing []iceberg.ManifestFile
+	deleted  []iceberg.ManifestEntry
+	// rewritten are the manifests this pass wrote; filtered are the results
+	// this pass computed, to be cached once the pass succeeds.
 	rewritten []iceberg.ManifestFile
+	filtered  map[string]filteredManifest
 }
 
 func newOverwriteFilesProducer(op Operation, txn *Transaction, fs iceio.WriteFileIO, commitUUID *uuid.UUID, snapshotProps iceberg.Properties) *snapshotProducer {
@@ -217,6 +234,11 @@ func (of *overwriteFiles) parentDependentManifests(
 
 		return nil, err
 	}
+
+	if of.filtered == nil {
+		of.filtered = make(map[string]filteredManifest, len(parentManifests.filtered))
+	}
+	maps.Copy(of.filtered, parentManifests.filtered)
 
 	return slices.Concat(deletedManifests, parentManifests.existing), nil
 }
@@ -325,36 +347,10 @@ func (of *overwriteFiles) rewriteManifest(
 	return wr.ToManifestFile(path, counter.Count, iceberg.WithManifestFileContent(m.ManifestContent()))
 }
 
-func (of *overwriteFiles) cleanupFilteredManifests(input []iceberg.ManifestFile, results [][]iceberg.ManifestFile) error {
-	inputPaths := make(map[string]struct{}, len(input))
-	for _, manifest := range input {
-		inputPaths[manifest.FilePath()] = struct{}{}
-	}
-
-	seen := make(map[string]struct{})
-	var cleanupErr error
-	for _, manifests := range results {
-		for _, manifest := range manifests {
-			path := manifest.FilePath()
-			if _, ok := inputPaths[path]; ok {
-				continue
-			}
-			if _, ok := seen[path]; ok {
-				continue
-			}
-			seen[path] = struct{}{}
-			if err := of.base.io.Remove(path); err != nil {
-				cleanupErr = errors.Join(cleanupErr, fmt.Errorf("remove filtered manifest %s: %w", path, err))
-			}
-		}
-	}
-
-	return cleanupErr
-}
-
 // filterAndRewriteParentManifests scans each inherited manifest once, using the
 // same pass to collect tombstones and rewrite surviving entries. The old
 // producer path needed one full manifest read for each of those operations.
+// Manifests filtered by an earlier pass are not read again.
 func (of *overwriteFiles) filterAndRewriteParentManifests(
 	ctx context.Context,
 	parent *Snapshot,
@@ -369,23 +365,35 @@ func (of *overwriteFiles) filterAndRewriteParentManifests(
 		return result, err
 	}
 
-	manifestResults := make([][]iceberg.ManifestFile, len(manifestList))
-	scanResults := make([]overwriteManifestScan, len(manifestList))
+	results := make([]filteredManifest, len(manifestList))
+	rewritten := make([]bool, len(manifestList))
+	cached := make([]bool, len(manifestList))
 	g, gctx := errgroup.WithContext(ctx)
 	g.SetLimit(min(of.manifestWorkerCount(), len(manifestList)))
 	for index, manifest := range manifestList {
+		if prior, ok := of.filtered[manifest.FilePath()]; ok {
+			results[index] = prior
+			cached[index] = true
+
+			continue
+		}
+		if of.base.keepsUnread(manifest) {
+			results[index].manifests = []iceberg.ManifestFile{manifest}
+
+			continue
+		}
 		g.Go(func() error {
 			scan, err := of.scanManifest(gctx, manifest)
 			if err != nil {
 				return err
 			}
-			scanResults[index] = scan
+			results[index].deleted = scan.deleted
 
 			if len(scan.notDeleted) == 0 {
 				return nil
 			}
 			if len(scan.deleted) == 0 {
-				manifestResults[index] = []iceberg.ManifestFile{manifest}
+				results[index].manifests = []iceberg.ManifestFile{manifest}
 
 				return nil
 			}
@@ -394,28 +402,44 @@ func (of *overwriteFiles) filterAndRewriteParentManifests(
 			if err != nil {
 				return err
 			}
-			manifestResults[index] = []iceberg.ManifestFile{filtered}
+			results[index].manifests = []iceberg.ManifestFile{filtered}
+			rewritten[index] = true
 
 			return nil
 		})
 	}
 
-	if err := g.Wait(); err != nil {
-		if cleanupErr := of.cleanupFilteredManifests(manifestList, manifestResults); cleanupErr != nil {
-			return result, errors.Join(err, cleanupErr)
+	err = g.Wait()
+	for index, written := range rewritten {
+		if written {
+			result.rewritten = append(result.rewritten, results[index].manifests...)
+		}
+	}
+	if err != nil {
+		if cleanupErr := of.base.cleanupGeneratedManifests(result.rewritten); cleanupErr != nil {
+			return overwriteParentManifests{}, errors.Join(err, cleanupErr)
 		}
 
-		return result, err
+		return overwriteParentManifests{}, err
 	}
 
 	result.existing = make([]iceberg.ManifestFile, 0, len(manifestList))
 	result.deleted = make([]iceberg.ManifestEntry, 0, len(manifestList))
-	for index, manifests := range manifestResults {
-		result.existing = append(result.existing, manifests...)
-		result.deleted = append(result.deleted, scanResults[index].deleted...)
-		if len(scanResults[index].deleted) > 0 && len(scanResults[index].notDeleted) > 0 {
-			result.rewritten = append(result.rewritten, manifests...)
+	result.filtered = make(map[string]filteredManifest, len(manifestList))
+	for index, filtered := range results {
+		result.existing = append(result.existing, filtered.manifests...)
+		result.deleted = append(result.deleted, filtered.deleted...)
+		if cached[index] {
+			continue
 		}
+		result.filtered[manifestList[index].FilePath()] = filtered
+		// The scan matched every file this producer removes from the
+		// manifest, so a retry's checkRemovedFiles need not read it again.
+		var found manifestRemovals
+		for _, entry := range filtered.deleted {
+			of.base.collectRemoval(&found, manifestList[index].ManifestContent(), entry.DataFile())
+		}
+		of.base.recordChecked(manifestList[index], found)
 	}
 
 	return result, nil
@@ -778,6 +802,12 @@ type snapshotProducer struct {
 	deletedDeleteFiles      map[string]iceberg.DataFile
 	deletedDVsByRef         map[string]iceberg.DataFile
 	snapshotProps           iceberg.Properties
+
+	// checkedManifests caches, by manifest path, which of the files this
+	// producer removes each manifest checkRemovedFiles read holds. Manifests
+	// are immutable, so an OCC retry reads only the manifests it has not
+	// checked yet.
+	checkedManifests map[string]manifestRemovals
 }
 
 // deleteFileAddition carries the data sequence number of a rewritten delete
@@ -1467,37 +1497,96 @@ func (sp *snapshotProducer) checkRemovedFiles(parent *Snapshot) (*removedFilePre
 		return nil, err
 	}
 	for _, m := range manifests {
-		for entry, err := range sp.iterManifestEntries(m, true) {
-			if err != nil {
-				return nil, err
-			}
-			df := entry.DataFile()
-			if m.ManifestContent() == iceberg.ManifestContentData {
-				delete(missingData, df.FilePath())
-
-				continue
-			}
-			if IsDeletionVector(df) {
-				// A DV without a referenced data file cannot be matched by ref;
-				// skip it rather than misclassifying it as a path-keyed delete file.
-				// The path must match too: a peer may have superseded our DV with
-				// a replacement for the same data file (same ref, new path), and
-				// that replacement must not read as "our DV is still present".
-				if ref := internal.BorrowedDataFileReferencedDataFile(df); ref != nil {
-					if want, ok := sp.deletedDVsByRef[*ref]; ok && want.FilePath() == df.FilePath() {
-						present.dvRefs[*ref] = struct{}{}
-					}
-				}
-
-				continue
-			}
-			if _, want := sp.deletedDeleteFiles[df.FilePath()]; want {
-				present.deleteFiles[df.FilePath()] = struct{}{}
-			}
+		found, err := sp.removalsIn(m)
+		if err != nil {
+			return nil, err
+		}
+		for _, path := range found.dataFiles {
+			delete(missingData, path)
+		}
+		for _, path := range found.deleteFiles {
+			present.deleteFiles[path] = struct{}{}
+		}
+		for _, ref := range found.dvRefs {
+			present.dvRefs[ref] = struct{}{}
 		}
 	}
 
 	return sp.missingDataError(present, missingData)
+}
+
+// manifestRemovals lists the live files of one manifest that a producer
+// removes: data file paths, delete file paths, and the referenced data files
+// of deletion vectors.
+type manifestRemovals struct {
+	dataFiles   []string
+	deleteFiles []string
+	dvRefs      []string
+}
+
+// removalsIn returns the live files of m that this producer removes, reading
+// m only the first time it is checked.
+func (sp *snapshotProducer) removalsIn(m iceberg.ManifestFile) (manifestRemovals, error) {
+	if found, ok := sp.checkedManifests[m.FilePath()]; ok {
+		return found, nil
+	}
+
+	var found manifestRemovals
+	for entry, err := range sp.iterManifestEntries(m, true) {
+		if err != nil {
+			return manifestRemovals{}, err
+		}
+		sp.collectRemoval(&found, m.ManifestContent(), entry.DataFile())
+	}
+	sp.recordChecked(m, found)
+
+	return found, nil
+}
+
+// collectRemoval adds df, a live file of a manifest with the given content,
+// to found if this producer removes it.
+func (sp *snapshotProducer) collectRemoval(found *manifestRemovals, content iceberg.ManifestContent, df iceberg.DataFile) {
+	if content == iceberg.ManifestContentData {
+		if _, want := sp.deletedFiles[df.FilePath()]; want {
+			found.dataFiles = append(found.dataFiles, df.FilePath())
+		}
+
+		return
+	}
+	if IsDeletionVector(df) {
+		// A DV without a referenced data file cannot be matched by ref;
+		// skip it rather than misclassifying it as a path-keyed delete file.
+		// The path must match too: a peer may have superseded our DV with
+		// a replacement for the same data file (same ref, new path), and
+		// that replacement must not read as "our DV is still present".
+		if ref := internal.BorrowedDataFileReferencedDataFile(df); ref != nil {
+			if want, ok := sp.deletedDVsByRef[*ref]; ok && want.FilePath() == df.FilePath() {
+				found.dvRefs = append(found.dvRefs, *ref)
+			}
+		}
+
+		return
+	}
+	if _, want := sp.deletedDeleteFiles[df.FilePath()]; want {
+		found.deleteFiles = append(found.deleteFiles, df.FilePath())
+	}
+}
+
+// keepsUnread reports whether m is a data manifest with live files that
+// checkRemovedFiles found none of this producer's removals in, so it is
+// inherited as is without being read again.
+func (sp *snapshotProducer) keepsUnread(m iceberg.ManifestFile) bool {
+	found, ok := sp.checkedManifests[m.FilePath()]
+
+	return ok && m.ManifestContent() == iceberg.ManifestContentData &&
+		len(found.dataFiles) == 0 && (m.HasAddedFiles() || m.HasExistingFiles())
+}
+
+func (sp *snapshotProducer) recordChecked(m iceberg.ManifestFile, found manifestRemovals) {
+	if sp.checkedManifests == nil {
+		sp.checkedManifests = make(map[string]manifestRemovals)
+	}
+	sp.checkedManifests[m.FilePath()] = found
 }
 
 func (sp *snapshotProducer) missingDataError(present *removedFilePresence, missingData map[string]struct{}) (*removedFilePresence, error) {

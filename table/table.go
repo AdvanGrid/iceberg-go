@@ -637,6 +637,10 @@ func (t Table) doCommit(ctx context.Context, updates []Update, reqs []Requiremen
 	// attempts it is the freshly-loaded post-conflict state.
 	current := t.metadata
 
+	// prevConflicts is the previous attempt's conflict context, whose
+	// manifest reads the next attempt's validators reuse.
+	var prevConflicts *conflictContext
+
 	// numRetries counts retries; total attempts = 1 initial + numRetries.
 	totalAttempts := cfg.numRetries + 1
 
@@ -732,6 +736,7 @@ func (t Table) doCommit(ctx context.Context, updates []Update, reqs []Requiremen
 				// sentinel deliberately does not wrap ErrCommitFailed.
 				return nil, ccErr
 			}
+			prevConflicts = cc.sharingReadsOf(prevConflicts)
 			for _, v := range co.validators {
 				if vErr := v(cc); vErr != nil {
 					return nil, vErr
