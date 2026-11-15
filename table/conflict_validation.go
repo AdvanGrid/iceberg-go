@@ -206,17 +206,18 @@ const maxConflictManifestCacheBytes = 64 << 20
 var errConflictManifestIOReadOnly = errors.New("conflict manifest IO is read-only")
 
 // conflictManifestIO is a read-through cache used only while conflict
-// validators inspect one conflictContext. Manifest files are immutable after
-// they are committed, so the same path can be safely served from the cached
-// bytes to later validators without reopening the backing object store.
+// validators inspect the conflictContexts of one commit. Manifest files are
+// immutable after they are committed, so the same path can be safely served
+// from the cached bytes to later validators without reopening the backing
+// object store.
 //
 // The cache stores raw bytes instead of decoded entries. The first read still
 // streams from the backing IO and is recorded only when it has consumed the
 // size reported by Stat, so an early validator exit does not cache a partial
-// manifest. The cache is bounded per validation attempt; reads after the
-// bound fall through to the backing IO. Later reads stream decoded entries
-// from completed bytes and let each ManifestFile descriptor apply its own
-// inheritance metadata.
+// manifest. The cache is bounded per commit, whose retries share it through
+// sharingReadsOf; reads after the bound fall through to the backing IO. Later
+// reads stream decoded entries from completed bytes and let each
+// ManifestFile descriptor apply its own inheritance metadata.
 type conflictManifestIO struct {
 	base        iceio.IO
 	files       map[string][]byte
