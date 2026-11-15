@@ -22,6 +22,8 @@ import (
 	"fmt"
 	"maps"
 	"path/filepath"
+	"slices"
+	"strings"
 	"sync"
 	"testing"
 
@@ -34,51 +36,43 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// manifestReadCountingIO counts reads of the watched paths once watching
-// starts.
-type manifestReadCountingIO struct {
+// avroReadRecordingIO records the Avro files (manifests and manifest lists)
+// read since the last call to take.
+type avroReadRecordingIO struct {
 	iceio.LocalFS
 
-	mu       sync.Mutex
-	watching bool
-	watched  map[string]struct{}
-	reads    map[string]int
+	mu    sync.Mutex
+	reads map[string]struct{}
 }
 
-func (c *manifestReadCountingIO) record(name string) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if _, ok := c.watched[name]; c.watching && ok {
-		c.reads[name]++
+func (r *avroReadRecordingIO) record(name string) {
+	if !strings.HasSuffix(name, ".avro") {
+		return
 	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.reads[name] = struct{}{}
 }
 
-func (c *manifestReadCountingIO) Open(name string) (iceio.File, error) {
-	c.record(name)
+func (r *avroReadRecordingIO) Open(name string) (iceio.File, error) {
+	r.record(name)
 
-	return c.LocalFS.Open(name)
+	return r.LocalFS.Open(name)
 }
 
-func (c *manifestReadCountingIO) ReadFile(name string) ([]byte, error) {
-	c.record(name)
+func (r *avroReadRecordingIO) ReadFile(name string) ([]byte, error) {
+	r.record(name)
 
-	return c.LocalFS.ReadFile(name)
+	return r.LocalFS.ReadFile(name)
 }
 
-func (c *manifestReadCountingIO) watch(paths []string) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.watching = true
-	for _, p := range paths {
-		c.watched[p] = struct{}{}
-	}
-}
+func (r *avroReadRecordingIO) take() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	reads := slices.Sorted(maps.Keys(r.reads))
+	r.reads = map[string]struct{}{}
 
-func (c *manifestReadCountingIO) readCounts() map[string]int {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	return maps.Clone(c.reads)
+	return reads
 }
 
 // retryReadsScenario is a table of four data files, one manifest each, and a
@@ -139,6 +133,10 @@ func (s *retryReadsScenario) peerAddFile(current table.Metadata, rows string) ta
 	return cat.current
 }
 
+func (s *retryReadsScenario) appendUnrelated(current table.Metadata) table.Metadata {
+	return s.peerAddFile(current, fmt.Sprintf(`[{"id":%d,"val":"p"}]`, 100+s.peers))
+}
+
 // peerDeleteOverwritten commits the removal of the rows the writer overwrites.
 func (s *retryReadsScenario) peerDeleteOverwritten(current table.Metadata) table.Metadata {
 	tbl, cat := s.peerTable(current)
@@ -154,29 +152,49 @@ func overwrittenRows() iceberg.BooleanExpression {
 	return iceberg.LessThan(iceberg.Reference("id"), int64(5))
 }
 
-// overwrite overwrites the rows with id < 5 from the base snapshot. Each
-// CommitTable call but the last is rejected after peers[i] advanced the
-// table. Reads of the base snapshot's manifests are counted from the first
-// rejection on.
-func (s *retryReadsScenario) overwrite(peers ...func(table.Metadata) table.Metadata) (*occScenarioCatalog, map[string]int, error) {
-	baseManifests, err := s.base.CurrentSnapshot().Manifests(iceio.LocalFS{})
-	require.NoError(s.t, err)
-	paths := make([]string, len(baseManifests))
-	for i, m := range baseManifests {
-		paths[i] = m.FilePath()
+// headFiles returns the manifest list of meta's current snapshot and the
+// manifests that snapshot wrote.
+func headFiles(t *testing.T, meta table.Metadata) []string {
+	head := meta.CurrentSnapshot()
+	manifests, err := head.Manifests(iceio.LocalFS{})
+	require.NoError(t, err)
+	files := []string{head.ManifestList}
+	for _, m := range manifests {
+		if m.SnapshotID() == head.SnapshotID {
+			files = append(files, m.FilePath())
+		}
 	}
 
-	fs := &manifestReadCountingIO{watched: map[string]struct{}{}, reads: map[string]int{}}
-	conflict := 0
+	return files
+}
+
+// retry is one retried commit attempt of the writer: the files the peer
+// that rejected the attempt before it committed, and the Avro files the
+// retry read.
+type retry struct {
+	peerFiles []string
+	reads     []string
+}
+
+// overwrite overwrites the rows with id < 5 from the base snapshot. Each
+// CommitTable call but the last is rejected after peers[i] advanced the
+// table.
+func (s *retryReadsScenario) overwrite(peers ...func(table.Metadata) table.Metadata) (*occScenarioCatalog, []retry, error) {
+	fs := &avroReadRecordingIO{reads: map[string]struct{}{}}
+	var retries []retry
 	cat := &occScenarioCatalog{
 		current:       s.base,
 		conflictsLeft: len(peers),
 		location:      s.location,
 		onConflict: func(current table.Metadata) table.Metadata {
-			fs.watch(paths)
-			conflict++
+			if len(retries) > 0 {
+				retries[len(retries)-1].reads = fs.take()
+			}
+			next := peers[len(retries)](current)
+			retries = append(retries, retry{peerFiles: headFiles(s.t, next)})
+			fs.take()
 
-			return peers[conflict-1](current)
+			return next
 		},
 	}
 	tbl := table.New([]string{"default", "retry_reads"}, s.base, s.location+"/metadata/writer.metadata.json",
@@ -191,26 +209,29 @@ func (s *retryReadsScenario) overwrite(peers ...func(table.Metadata) table.Metad
 	tx := tbl.NewTransaction()
 	require.NoError(s.t, tx.Overwrite(s.t.Context(), rdr, nil, table.WithOverwriteFilter(overwrittenRows())))
 	_, err = tx.Commit(s.t.Context())
+	if len(retries) > 0 {
+		retries[len(retries)-1].reads = fs.take()
+	}
 
-	return cat, fs.readCounts(), err
+	return cat, retries, err
 }
 
-func (s *retryReadsScenario) appendUnrelated(current table.Metadata) table.Metadata {
-	return s.peerAddFile(current, fmt.Sprintf(`[{"id":%d,"val":"p"}]`, 100+s.peers))
-}
-
-// TestCommitRetryDoesNotRereadCheckedManifests checks that an overwrite that
-// loses the commit race several times reads each manifest it already checked
-// only once, as Java's ManifestFilterManager caches filtered manifests across
-// attempts: the retries read the manifests the peers added, not the ones the
-// writer's base snapshot already had.
-func TestCommitRetryDoesNotRereadCheckedManifests(t *testing.T) {
+// TestCommitRetryReadsOnlyNewManifests checks that an overwrite that loses
+// the commit race several times reads, on each retry, only the manifest
+// list and manifests the commit that beat it wrote. Like Java's
+// ManifestFilterManager, it keeps what it learned of every other manifest
+// from earlier attempts, and its conflict validation reads only manifests
+// the concurrent snapshots wrote.
+func TestCommitRetryReadsOnlyNewManifests(t *testing.T) {
 	s := newRetryReadsScenario(t)
 
-	cat, reads, err := s.overwrite(s.appendUnrelated, s.appendUnrelated, s.appendUnrelated)
+	cat, retries, err := s.overwrite(s.appendUnrelated, s.appendUnrelated, s.appendUnrelated)
 	require.NoError(t, err)
 	require.Equal(t, int32(4), cat.commitTableCalls.Load())
-	require.Empty(t, reads, "retries re-read manifests of the base snapshot")
+	require.Len(t, retries, 3)
+	for i, r := range retries {
+		require.Subset(t, r.peerFiles, r.reads, "retry %d read files of earlier snapshots", i+1)
+	}
 
 	tbl, _ := s.peerTable(cat.current)
 	assertRowCount(t, tbl, 2+2+2+3+1)

@@ -24,6 +24,8 @@ const (
 	snapshotAge    = time.Minute
 	orphanAge      = 2 * time.Minute
 	maintenanceGap = 2 * time.Second
+	// objectStoreLatency is a typical S3 time to first byte.
+	objectStoreLatency = 25 * time.Millisecond
 )
 
 func dayPartitioned() catalog.CreateTableOpt {
@@ -231,7 +233,8 @@ func maintain(ctx context.Context, cat catalog.Catalog, ident table.Identifier, 
 // TestConcurrentWritersAndMaintenance runs two writers on disjoint days and
 // a maintenance loop of expiry and orphan removal against one table at the
 // same time. One writer appends and overwrites every few seconds, the other
-// appends about once a second. Every overwrite must commit through the
+// appends about once a second; both reach storage with an object store's
+// latency. Every overwrite must commit through the
 // retries, the table must hold the union of the writers' models, and orphan
 // removal must keep the data files of a write that is in flight and younger
 // than the age threshold.
@@ -246,7 +249,7 @@ func TestConcurrentWritersAndMaintenance(t *testing.T) {
 			writers := make([]*concurrentWriter, 2)
 			for i := range writers {
 				writers[i] = &concurrentWriter{
-					cat:   lane.Open(t).Catalog,
+					cat:   lane.CatalogVia(t, lane.LatencyProxy(t, objectStoreLatency)),
 					ident: ident,
 					days:  []int{i, i + 2, i + 4, i + 6},
 					gen:   lane.NewGen(uint64(10 + i)),
