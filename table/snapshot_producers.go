@@ -150,11 +150,36 @@ type overwriteFiles struct {
 	// semantically compatible with a rewrite.
 	skipDefaultValidator bool
 
-	// filtered caches the result of filtering each inherited manifest, by
-	// manifest path, so an OCC retry reads and rewrites only the manifests
-	// it has not filtered yet. Java's ManifestFilterManager keeps the same
-	// cache across commit attempts.
-	filtered map[string]filteredManifest
+	// filtered caches the result of filtering each inherited manifest so an
+	// OCC retry reads and rewrites only the manifests it has not filtered
+	// yet. Java's ManifestFilterManager keeps the same cache across commit
+	// attempts.
+	filtered map[filterKey]filteredManifest
+}
+
+// filterKey identifies an inherited manifest together with the values its
+// entries inherit from the manifest list. A manifest that a sibling snapshot
+// staged earlier in the same transaction keeps its path on a retry but gets
+// a new sequence number and first row ID, so it must be filtered again.
+type filterKey struct {
+	path           string
+	sequenceNum    int64
+	minSequenceNum int64
+	firstRowID     int64
+}
+
+func filterKeyOf(m iceberg.ManifestFile) filterKey {
+	key := filterKey{
+		path:           m.FilePath(),
+		sequenceNum:    m.SequenceNum(),
+		minSequenceNum: m.MinSequenceNum(),
+		firstRowID:     -1,
+	}
+	if id := m.FirstRowID(); id != nil {
+		key.firstRowID = *id
+	}
+
+	return key
 }
 
 type overwriteManifestScan struct {
@@ -176,7 +201,7 @@ type overwriteParentManifests struct {
 	// rewritten are the manifests this pass wrote; filtered are the results
 	// this pass computed, to be cached once the pass succeeds.
 	rewritten []iceberg.ManifestFile
-	filtered  map[string]filteredManifest
+	filtered  map[filterKey]filteredManifest
 }
 
 func newOverwriteFilesProducer(op Operation, txn *Transaction, fs iceio.WriteFileIO, commitUUID *uuid.UUID, snapshotProps iceberg.Properties) *snapshotProducer {
@@ -236,7 +261,7 @@ func (of *overwriteFiles) parentDependentManifests(
 	}
 
 	if of.filtered == nil {
-		of.filtered = make(map[string]filteredManifest, len(parentManifests.filtered))
+		of.filtered = make(map[filterKey]filteredManifest, len(parentManifests.filtered))
 	}
 	maps.Copy(of.filtered, parentManifests.filtered)
 
@@ -371,8 +396,11 @@ func (of *overwriteFiles) filterAndRewriteParentManifests(
 	g, gctx := errgroup.WithContext(ctx)
 	g.SetLimit(min(of.manifestWorkerCount(), len(manifestList)))
 	for index, manifest := range manifestList {
-		if prior, ok := of.filtered[manifest.FilePath()]; ok {
+		if prior, ok := of.filtered[filterKeyOf(manifest)]; ok {
 			results[index] = prior
+			if len(prior.manifests) == 1 && prior.manifests[0].FilePath() == manifest.FilePath() {
+				results[index].manifests = []iceberg.ManifestFile{manifest}
+			}
 			cached[index] = true
 
 			continue
@@ -425,14 +453,14 @@ func (of *overwriteFiles) filterAndRewriteParentManifests(
 
 	result.existing = make([]iceberg.ManifestFile, 0, len(manifestList))
 	result.deleted = make([]iceberg.ManifestEntry, 0, len(manifestList))
-	result.filtered = make(map[string]filteredManifest, len(manifestList))
+	result.filtered = make(map[filterKey]filteredManifest, len(manifestList))
 	for index, filtered := range results {
 		result.existing = append(result.existing, filtered.manifests...)
 		result.deleted = append(result.deleted, filtered.deleted...)
 		if cached[index] {
 			continue
 		}
-		result.filtered[manifestList[index].FilePath()] = filtered
+		result.filtered[filterKeyOf(manifestList[index])] = filtered
 		// The scan matched every file this producer removes from the
 		// manifest, so a retry's checkRemovedFiles need not read it again.
 		var found manifestRemovals
