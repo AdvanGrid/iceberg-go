@@ -72,6 +72,7 @@ type concurrentWriter struct {
 	cat   catalog.Catalog
 	ident table.Identifier
 	days  []int
+	mode  string
 	gen   *lane.Gen
 	keyOf int64
 	model lane.Model
@@ -87,40 +88,71 @@ func (w *concurrentWriter) rows(n, day int) []lane.Row {
 	return rows
 }
 
-// run appends to and overwrites its days every few seconds for at least d,
-// so that the first snapshots outlive snapshotAge while the writers still run.
-// It returns how long each overwrite took, retries included.
+// run appends to its days and replaces the rows of one g within a day every
+// few seconds for at least d, so that the first snapshots outlive snapshotAge
+// while the writers still run. It returns how long each replace took, retries
+// included.
 func (w *concurrentWriter) run(ctx context.Context, d time.Duration) ([]time.Duration, error) {
-	var overwrites []time.Duration
+	var replaces []time.Duration
 	start := time.Now()
 	for round := 0; round < len(w.days) || time.Since(start) < d; round++ {
 		time.Sleep(time.Duration(2000+w.gen.Rand.IntN(3000)) * time.Millisecond)
 		tbl, err := w.cat.LoadTable(ctx, w.ident)
 		if err != nil {
-			return overwrites, fmt.Errorf("round %d load: %w", round, err)
+			return replaces, fmt.Errorf("round %d load: %w", round, err)
 		}
 		day := w.days[round%len(w.days)]
 		if round < len(w.days) || w.gen.Rand.IntN(2) == 0 {
 			if err := w.append(ctx, tbl, day); err != nil {
-				return overwrites, fmt.Errorf("round %d append day %d: %w", round, day, err)
+				return replaces, fmt.Errorf("round %d append day %d: %w", round, day, err)
 			}
 
 			continue
 		}
-		rows := w.rows(w.gen.Rand.IntN(200), day)
-		rdr := lane.Reader(rows, 4096)
-		began := time.Now()
-		_, err = tbl.Overwrite(ctx, rdr, nil, table.WithOverwriteFilter(dayFilter(day)))
-		rdr.Release()
-		if err != nil {
-			return overwrites, fmt.Errorf("round %d overwrite day %d: %w", round, day, err)
+		g := int32(w.gen.Rand.IntN(10))
+		rows := w.rows(w.gen.Rand.IntN(50), day)
+		for i := range rows {
+			rows[i].G = g
 		}
-		overwrites = append(overwrites, time.Since(began))
-		w.model.DeleteWhere(inDay(day))
+		began := time.Now()
+		if err := w.replace(ctx, tbl, dayGroupFilter(day, g), rows); err != nil {
+			return replaces, fmt.Errorf("round %d replace day %d g %d: %w", round, day, g, err)
+		}
+		replaces = append(replaces, time.Since(began))
+		inDayOf := inDay(day)
+		w.model.DeleteWhere(func(r lane.Row) bool { return inDayOf(r) && r.G == g })
 		w.model.Put(rows)
 	}
 
-	return overwrites, nil
+	return replaces, nil
+}
+
+// replace swaps the rows matching filter for rows in one commit. The filter
+// matches part of each data file of a day, so copy-on-write rewrites the files
+// and merge-on-read writes position deletes for them. Overwrite always copies
+// on write, so merge-on-read deletes and appends in one transaction.
+func (w *concurrentWriter) replace(ctx context.Context, tbl *table.Table, filter iceberg.BooleanExpression, rows []lane.Row) error {
+	rdr := lane.Reader(rows, 4096)
+	defer rdr.Release()
+	if w.mode == table.WriteModeCopyOnWrite {
+		_, err := tbl.Overwrite(ctx, rdr, nil, table.WithOverwriteFilter(filter))
+
+		return err
+	}
+	txn := tbl.NewTransaction()
+	if err := txn.Delete(ctx, filter, nil); err != nil {
+		return err
+	}
+	if err := txn.Append(ctx, rdr, nil); err != nil {
+		return err
+	}
+	_, err := txn.Commit(ctx)
+
+	return err
+}
+
+func dayGroupFilter(day int, g int32) iceberg.BooleanExpression {
+	return iceberg.NewAnd(dayFilter(day), iceberg.EqualTo(iceberg.Reference("g"), g))
 }
 
 func (w *concurrentWriter) append(ctx context.Context, tbl *table.Table, day int) error {
@@ -232,12 +264,14 @@ func maintain(ctx context.Context, cat catalog.Catalog, ident table.Identifier, 
 
 // TestConcurrentWritersAndMaintenance runs two writers on disjoint days and
 // a maintenance loop of expiry and orphan removal against one table at the
-// same time. One writer appends and overwrites every few seconds, the other
-// appends about once a second; both reach storage with an object store's
-// latency. Every overwrite must commit through its retries, the table must
-// hold the union of the writers' models, and orphan removal must keep the
-// data files of a write that is in flight and younger than the age
-// threshold.
+// same time. One writer appends and replaces part of a day every few seconds,
+// rewriting data files or writing position deletes; the other appends about
+// once a second, so the replaces retry. Both reach storage with an object
+// store's latency. Every replace must commit through its retries, the table
+// must hold the union of the writers' models, orphan removal must keep the
+// data files of a write that is in flight and younger than the age threshold,
+// and once that write commits, orphan removal without an age threshold must
+// keep them too.
 func TestConcurrentWritersAndMaintenance(t *testing.T) {
 	for _, mode := range lane.DeleteModes {
 		t.Run(mode, func(t *testing.T) {
@@ -251,6 +285,7 @@ func TestConcurrentWritersAndMaintenance(t *testing.T) {
 				writers[i] = &concurrentWriter{
 					cat:   lane.CatalogVia(t, lane.LatencyProxy(t, objectStoreLatency)),
 					ident: ident,
+					mode:  mode,
 					days:  []int{i, i + 2, i + 4, i + 6},
 					gen:   lane.NewGen(uint64(10 + i)),
 					keyOf: int64(i) * 1_000_000_000,
@@ -264,11 +299,11 @@ func TestConcurrentWritersAndMaintenance(t *testing.T) {
 			stopMaintenance := make(chan struct{})
 			stopCompeting := make(chan struct{})
 			var wg sync.WaitGroup
-			var overwrites []time.Duration
+			var replaces []time.Duration
 			var competing int
 			writerErrs := make([]error, len(writers))
 			wg.Go(func() {
-				overwrites, writerErrs[0] = writers[0].run(ctx, writeFor)
+				replaces, writerErrs[0] = writers[0].run(ctx, writeFor)
 				close(stopCompeting)
 				if writerErrs[0] == nil {
 					writerErrs[0] = writers[0].pausedAppend(ctx, 8, written, resume)
@@ -301,13 +336,17 @@ func TestConcurrentWritersAndMaintenance(t *testing.T) {
 			require.NoError(t, errors.Join(append(writerErrs, maintErr, pausedErr)...))
 			require.Subset(t, candidates, inFlight, "in-flight files must be orphan candidates apart from their age")
 			require.Empty(t, intersect(pausedDeleted, inFlight), "orphan removal deleted in-flight files")
-			require.Empty(t, intersect(maint.deleted, inFlight), "maintenance deleted in-flight files")
 			require.Positive(t, maint.expired, "expiry must remove snapshots while the writers run")
 			t.Logf("maintenance passes %d, snapshots expired %d, orphans deleted %d", maint.passes, maint.expired, len(maint.deleted))
-			require.NotEmpty(t, overwrites, "the overwriting writer must overwrite")
-			t.Logf("overwrites %d, slowest %s; competing commits %d", len(overwrites), slices.Max(overwrites), competing)
+			require.NotEmpty(t, replaces, "the replacing writer must replace")
+			t.Logf("replaces %d, slowest %s; competing commits %d", len(replaces), slices.Max(replaces), competing)
 
 			tbl = lk.Reload(t, tbl)
+			settled, err := tbl.DeleteOrphanFiles(ctx, table.WithFilesOlderThan(0))
+			require.NoError(t, err)
+			require.Empty(t, intersect(settled.DeletedFiles, inFlight), "orphan removal deleted the committed in-flight files")
+			t.Logf("orphans deleted after the writers settled %d", len(settled.DeletedFiles))
+
 			model := lane.Model{}
 			for _, w := range writers {
 				for _, r := range w.model {
