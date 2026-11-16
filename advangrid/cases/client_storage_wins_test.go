@@ -2,6 +2,7 @@ package cases
 
 import (
 	"context"
+	"net/url"
 	"testing"
 	"time"
 
@@ -10,12 +11,16 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-const preferClientConfigKey = "rest.prefer-client-config"
+const (
+	preferClientConfigKey = "rest.prefer-client-config"
+	splitStorageHost      = "spark-iceberg:3900"
+)
 
 // TestClientStorageEndpointWins writes from the host to the split warehouse,
 // whose catalog-side storage endpoint the host cannot resolve. The catalog's
-// table config wins by default, so the write fails; with the client config
-// preferred it goes to the client's endpoint, and all engines read it.
+// table config wins by default, so the write goes to the catalog's endpoint
+// and fails; with the client config preferred it goes to the client's
+// endpoint, and all engines read it.
 func TestClientStorageEndpointWins(t *testing.T) {
 	ctx := context.Background()
 	from, to := lane.Day(0)
@@ -29,7 +34,11 @@ func TestClientStorageEndpointWins(t *testing.T) {
 		writeCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 		defer cancel()
 		_, err := tbl.Append(writeCtx, rdr, nil)
-		require.Error(t, err)
+		var urlErr *url.Error
+		require.ErrorAs(t, err, &urlErr)
+		target, err := url.Parse(urlErr.URL)
+		require.NoError(t, err)
+		require.Equal(t, splitStorageHost, target.Host, "the write must go to the catalog's storage endpoint")
 	})
 
 	t.Run("client config wins when preferred", func(t *testing.T) {
