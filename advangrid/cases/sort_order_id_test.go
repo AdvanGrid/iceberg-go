@@ -3,6 +3,7 @@ package cases
 import (
 	"context"
 	"fmt"
+	"slices"
 	"testing"
 
 	"github.com/AdvanGrid/iceberg-go/advangrid/lane"
@@ -31,7 +32,9 @@ func sparkSortOrderIDs(ctx context.Context, t *testing.T, lk *lane.Lake, tbl *ta
 
 // TestSortOrderIDOnFilesInOrder checks with Spark that data files carry the
 // table's sort order id when their rows are in the declared order: after a
-// sorted append and after sort compaction, and not after an unsorted append.
+// sorted append, in one batch or in several that continue in order, and
+// after sort compaction; not after an unsorted append, nor after one whose
+// batches are each sorted but one starts below the end of the batch before.
 func TestSortOrderIDOnFilesInOrder(t *testing.T) {
 	ctx := context.Background()
 	lk := lane.Open(t)
@@ -69,10 +72,21 @@ func TestSortOrderIDOnFilesInOrder(t *testing.T) {
 	sortedFile := appendRows(sorted, len(sorted))[0]
 	from, to = lane.Day(3)
 	unsortedFile := appendRows(gen.Rows(400, from, to), 50)[0]
+	from, to = lane.Day(6)
+	sorted = gen.Rows(400, from, to)
+	sortByGK(sorted)
+	inOrderBatchesFile := appendRows(sorted, 50)[0]
+	from, to = lane.Day(9)
+	sorted = gen.Rows(400, from, to)
+	sortByGK(sorted)
+	firstBatchLast := append(slices.Clone(sorted[50:]), sorted[:50]...)
+	outOfOrderBatchesFile := appendRows(firstBatchLast, 50)[0]
 
 	ids := sparkSortOrderIDs(ctx, t, lk, tbl)
 	require.Equal(t, "1", ids[sortedFile], "sorted append")
 	require.Equal(t, "null", ids[unsortedFile], "unsorted append")
+	require.Equal(t, "1", ids[inOrderBatchesFile], "sorted append in batches that continue in order")
+	require.Equal(t, "null", ids[outOfOrderBatchesFile], "sorted batches, the last starting below the one before")
 
 	tbl = compactForOrder(ctx, t, tbl)
 	lk.RequireChecksum(t, tbl, 0, model.Checksum())
