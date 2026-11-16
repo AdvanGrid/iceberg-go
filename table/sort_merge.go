@@ -127,6 +127,40 @@ func (c *sortComparer) compare(a arrow.RecordBatch, i int, b arrow.RecordBatch, 
 	return 0
 }
 
+// hasNaN reports whether a float sort key of rec holds a NaN. The Arrow
+// sort places NaN by the null order, so rows it sorted are in the
+// comparer's order only when no sort key holds a NaN.
+func (c *sortComparer) hasNaN(rec arrow.RecordBatch) bool {
+	for _, key := range c.keys {
+		switch col := rec.Column(key.column).(type) {
+		case *array.Float32:
+			if floatsHaveNaN(col) {
+				return true
+			}
+		case *array.Float64:
+			if floatsHaveNaN(col) {
+				return true
+			}
+		}
+	}
+
+	return false
+}
+
+func floatsHaveNaN[T float32 | float64, A interface {
+	orderedValues[T]
+	Len() int
+	IsValid(int) bool
+}](a A) bool {
+	for i := range a.Len() {
+		if v := a.Value(i); v != v && a.IsValid(i) {
+			return true
+		}
+	}
+
+	return false
+}
+
 // inOrder reports whether records are in the comparer's order. It stops at
 // the first row out of order and releases every batch it reads.
 func (c *sortComparer) inOrder(records iter.Seq2[arrow.RecordBatch, error]) (bool, error) {
@@ -369,6 +403,8 @@ func taskInOrder(ctx context.Context, keyScan *Scan, order SortOrder, task FileS
 }
 
 // sortedInMemory reads all of records and yields them sorted by order.
+// Records whose float sort keys hold a NaN are sorted with the comparer,
+// the others with the Arrow sort.
 func sortedInMemory(ctx context.Context, order SortOrder, schema *iceberg.Schema, records iter.Seq2[arrow.RecordBatch, error], batchRows int) iter.Seq2[arrow.RecordBatch, error] {
 	return func(yield func(arrow.RecordBatch, error) bool) {
 		var batches []arrow.RecordBatch
@@ -389,15 +425,18 @@ func sortedInMemory(ctx context.Context, order SortOrder, schema *iceberg.Schema
 			return
 		}
 
-		keys, err := resolveSortKeys(order, schema)
+		cmp, err := newSortComparer(order, schema, batches[0].Schema())
 		if err != nil {
 			yield(nil, err)
 
 			return
 		}
-		unsorted := array.NewTableFromRecords(batches[0].Schema(), batches)
-		defer unsorted.Release()
-		sorted, err := compute.SortTable(ctx, unsorted, keys)
+		var sorted arrow.Table
+		if slices.ContainsFunc(batches, cmp.hasNaN) {
+			sorted, err = sortedByComparer(ctx, cmp, batches)
+		} else {
+			sorted, err = sortedByArrow(ctx, order, schema, batches)
+		}
 		if err != nil {
 			yield(nil, err)
 
@@ -415,6 +454,48 @@ func sortedInMemory(ctx context.Context, order SortOrder, schema *iceberg.Schema
 			}
 		}
 	}
+}
+
+func sortedByArrow(ctx context.Context, order SortOrder, schema *iceberg.Schema, batches []arrow.RecordBatch) (arrow.Table, error) {
+	keys, err := resolveSortKeys(order, schema)
+	if err != nil {
+		return nil, err
+	}
+	unsorted := array.NewTableFromRecords(batches[0].Schema(), batches)
+	defer unsorted.Release()
+
+	return compute.SortTable(ctx, unsorted, keys)
+}
+
+func sortedByComparer(ctx context.Context, cmp *sortComparer, batches []arrow.RecordBatch) (arrow.Table, error) {
+	mem := compute.GetAllocator(ctx)
+	unsorted, err := concatRecords(mem, batches)
+	if err != nil {
+		return nil, err
+	}
+	defer unsorted.Release()
+
+	indices := make([]int64, unsorted.NumRows())
+	for i := range indices {
+		indices[i] = int64(i)
+	}
+	slices.SortStableFunc(indices, func(i, j int64) int {
+		return cmp.compare(unsorted, int(i), unsorted, int(j))
+	})
+	bldr := array.NewInt64Builder(mem)
+	defer bldr.Release()
+	bldr.AppendValues(indices, nil)
+	take := bldr.NewInt64Array()
+	defer take.Release()
+
+	out, err := compute.Take(ctx, *compute.DefaultTakeOptions(), compute.NewDatumWithoutOwning(unsorted), compute.NewDatumWithoutOwning(take))
+	if err != nil {
+		return nil, err
+	}
+	defer out.Release()
+	sorted := out.(*compute.RecordDatum).Value
+
+	return array.NewTableFromRecords(sorted.Schema(), []arrow.RecordBatch{sorted}), nil
 }
 
 type mergeCursor struct {

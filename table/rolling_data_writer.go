@@ -626,13 +626,16 @@ func (r *RollingDataWriter) stream(outputDataFilesCh chan<- iceberg.DataFile) {
 	}
 
 	// trackOrder drops the current file's sort order claim when sorted, a
-	// batch sorted on its own, starts before the file's last row.
+	// batch sorted on its own, starts before the file's last row, or holds a
+	// NaN sort key value, which the Arrow sort may place out of the declared
+	// order.
 	trackOrder := func(sorted arrow.RecordBatch) error {
 		n := sorted.NumRows()
 		if r.factory.sortCmp == nil || n == 0 {
 			return nil
 		}
-		if lastRow != nil && r.factory.sortCmp.compare(lastRow, 0, sorted, 0) > 0 {
+		if (lastRow != nil && r.factory.sortCmp.compare(lastRow, 0, sorted, 0) > 0) ||
+			r.factory.sortCmp.hasNaN(sorted) {
 			currentWriter.DropSortOrder()
 		}
 		tail := sorted.NewSlice(n-1, n)
