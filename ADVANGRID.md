@@ -72,6 +72,7 @@ PR numbers refer to this repository. Every row's PR was red on its tests-only co
 
 - `validateDataFilesExist` still scans the branch head on every retry (#24 left it as upstream had it); it runs for merge-on-read partial deletes, row delta and compaction with deletion vectors, not for overwrites.
 - A merge append whose commit lands on a retry keeps the first attempt's merged manifests (#9); orphan removal deletes them.
+- The sort comparer (`table/sort_merge.go` `compareFloat`) and Arrow's sort treat -0.0 and 0.0 as equal, so a file holding 0.0 before -0.0 in a float sort key keeps `sort_order_id`. Iceberg Java (`Double.compare`) and the spec order -0.0 before 0.0; Spark treats them as equal. No rows are read wrong.
 
 Trade-offs kept on purpose:
 
