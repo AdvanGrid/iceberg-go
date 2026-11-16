@@ -20,6 +20,7 @@ package table
 import (
 	"context"
 	"errors"
+	"math"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -493,6 +494,82 @@ func (s *RollingDataWriterTestSuite) TestWriterStampsSortOrderIDOnlyForFilesInOr
 					bldr.Field(0).(*array.Int32Builder).Append(id)
 					bldr.Field(1).(*array.StringBuilder).Append("value")
 				}
+				record := bldr.NewRecordBatch()
+				bldr.Release()
+				s.Require().NoError(writer.Add(record))
+				record.Release()
+			}
+			s.Require().NoError(writer.closeAndWait())
+			close(outputCh)
+
+			var gotIDs []*int
+			for df := range outputCh {
+				gotIDs = append(gotIDs, df.SortOrderID())
+			}
+			s.Equal(tt.wantIDs, gotIDs)
+		})
+	}
+}
+
+// TestWriterDropsSortOrderIDForNaNSortKey writes float batches to a table
+// sorted by x ascending, nulls first. Arrow places NaN by the null order, the
+// declared order places it after every other value, so a file with a NaN
+// sort key value must not carry the sort order id.
+func (s *RollingDataWriterTestSuite) TestWriterDropsSortOrderIDForNaNSortKey() {
+	arrSchema := arrow.NewSchema([]arrow.Field{
+		{Name: "x", Type: arrow.PrimitiveTypes.Float64, Nullable: true},
+	}, nil)
+	nan := math.NaN()
+
+	tests := []struct {
+		name    string
+		batches [][]float64
+		wantIDs []*int
+	}{
+		{"floats without NaN", [][]float64{{2, 1}, {3}}, []*int{ptr(1)}},
+		{"NaN in one batch", [][]float64{{2, nan, 1}}, []*int{nil}},
+		{"a batch with NaN starting below the previous one", [][]float64{{5}, {2, nan, 1}}, []*int{nil}},
+	}
+	for _, tt := range tests {
+		s.Run(tt.name, func() {
+			loc := filepath.ToSlash(s.T().TempDir())
+			icebergSchema, err := ArrowSchemaToIcebergWithFreshIDs(arrSchema, false)
+			s.Require().NoError(err)
+			sortOrder, err := NewSortOrder(1, []SortField{{
+				SourceIDs: []int{icebergSchema.Fields()[0].ID},
+				Direction: SortASC,
+				Transform: iceberg.IdentityTransform{},
+				NullOrder: NullsFirst,
+			}})
+			s.Require().NoError(err)
+			spec := iceberg.NewPartitionSpec()
+			meta, err := NewMetadata(icebergSchema, &spec, sortOrder, loc, iceberg.Properties{})
+			s.Require().NoError(err)
+			metaBuilder, err := MetadataBuilderFromBase(meta, "")
+			s.Require().NoError(err)
+
+			writeUUID := uuid.New()
+			args := recordWritingArgs{
+				sc:        arrSchema,
+				fs:        iceio.LocalFS{},
+				writeUUID: &writeUUID,
+				counter: func(yield func(int) bool) {
+					for i := 0; ; i++ {
+						if !yield(i) {
+							break
+						}
+					}
+				},
+			}
+			factory, err := newWriterFactory(loc, args, metaBuilder, icebergSchema, 1024*1024)
+			s.Require().NoError(err)
+			defer factory.closeAll()
+
+			outputCh := make(chan iceberg.DataFile, 10)
+			writer := factory.newRollingDataWriter(s.ctx, "", nil, outputCh)
+			for _, xs := range tt.batches {
+				bldr := array.NewRecordBuilder(s.mem, arrSchema)
+				bldr.Field(0).(*array.Float64Builder).AppendValues(xs, nil)
 				record := bldr.NewRecordBatch()
 				bldr.Release()
 				s.Require().NoError(writer.Add(record))

@@ -20,6 +20,7 @@ package table_test
 import (
 	"context"
 	"fmt"
+	"math"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -245,4 +246,82 @@ func TestExecuteCompactionGroup_SortStrategyRefusesDeleteFiles(t *testing.T) {
 		GroupOptions: []table.CompactionGroupOption{table.WithCompactionStrategy(table.SortStrategy)},
 	})
 	require.ErrorIs(t, err, table.ErrInvalidOperation)
+}
+
+// TestExecuteCompactionGroup_SortStrategyOrdersAroundNaN compacts a file
+// out of order whose float sort key holds a NaN with a file in order. The
+// numbers must come out in order, and the output files, which hold a NaN
+// that the writer places by the null order, must not claim the sort order.
+func TestExecuteCompactionGroup_SortStrategyOrdersAroundNaN(t *testing.T) {
+	location := filepath.ToSlash(t.TempDir())
+	schema := iceberg.NewSchema(0,
+		iceberg.NestedField{ID: 1, Name: "x", Type: iceberg.PrimitiveTypes.Float64, Required: false},
+	)
+	order, err := table.NewSortOrder(1, []table.SortField{{
+		SourceIDs: []int{1}, Transform: iceberg.IdentityTransform{},
+		Direction: table.SortASC, NullOrder: table.NullsFirst,
+	}})
+	require.NoError(t, err)
+	meta, err := table.NewMetadata(schema, iceberg.UnpartitionedSpec, order, location,
+		iceberg.Properties{table.PropertyFormatVersion: "2"})
+	require.NoError(t, err)
+	tbl := table.New(
+		table.Identifier{"db", "sort_rewrite_nan_test"},
+		meta, location+"/metadata/v1.metadata.json",
+		func(context.Context) (iceio.IO, error) { return iceio.LocalFS{}, nil },
+		&rowDeltaCatalog{metadata: meta},
+	)
+
+	arrowSc, err := table.SchemaToArrowSchema(tbl.Schema(), nil, false, false)
+	require.NoError(t, err)
+	paths := []string{location + "/data/out-of-order.parquet", location + "/data/in-order.parquet"}
+	writeParquetFile(t, paths[0], arrowSc, `[{"x": 2}, {"x": "NaN"}, {"x": 1}]`)
+	writeParquetFile(t, paths[1], arrowSc, `[{"x": 0}, {"x": 3}]`)
+	tx := tbl.NewTransaction()
+	require.NoError(t, tx.AddFiles(t.Context(), paths, nil, false))
+	tbl, err = tx.Commit(t.Context())
+	require.NoError(t, err)
+
+	result, err := table.ExecuteCompactionGroup(t.Context(), tbl, wholeTableGroup(t, tbl),
+		table.WithCompactionStrategy(table.SortStrategy),
+		table.WithCompactionArrowBatchSize(2))
+	require.NoError(t, err)
+
+	var numbers []float64
+	nans := 0
+	for _, df := range result.NewDataFiles {
+		assert.Nil(t, df.SortOrderID(), df.FilePath())
+		for _, x := range fileFloats(t, df) {
+			if math.IsNaN(x) {
+				nans++
+
+				continue
+			}
+			numbers = append(numbers, x)
+		}
+	}
+	assert.Equal(t, []float64{0, 1, 2, 3}, numbers)
+	assert.Equal(t, 1, nans)
+}
+
+// fileFloats reads the first column of a data file of float64 in file order.
+func fileFloats(t *testing.T, df iceberg.DataFile) []float64 {
+	t.Helper()
+
+	rdr, err := file.OpenParquetFile(strings.TrimPrefix(df.FilePath(), "file://"), false)
+	require.NoError(t, err)
+	defer rdr.Close()
+
+	arrowRdr, err := pqarrow.NewFileReader(rdr, pqarrow.ArrowReadProperties{}, memory.DefaultAllocator)
+	require.NoError(t, err)
+	tbl, err := arrowRdr.ReadTable(t.Context())
+	require.NoError(t, err)
+	defer tbl.Release()
+
+	var xs []float64
+	for _, chunk := range tbl.Column(0).Data().Chunks() {
+		xs = append(xs, chunk.(*array.Float64).Float64Values()...)
+	}
+
+	return xs
 }
