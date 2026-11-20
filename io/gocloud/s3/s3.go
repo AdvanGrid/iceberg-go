@@ -254,7 +254,9 @@ func createS3Bucket(ctx context.Context, parsed *url.URL, props map[string]strin
 	})
 
 	// Create a *blob.Bucket.
-	bucket, err := s3blob.OpenBucketV2(ctx, client, parsed.Host, nil)
+	bucket, err := s3blob.OpenBucketV2(ctx, client, parsed.Host, &s3blob.Options{
+		RequestChecksumCalculation: awscfg.RequestChecksumCalculation,
+	})
 	if err != nil {
 		return nil, err
 	}

@@ -1063,3 +1063,40 @@ func TestNonCompatModeStillSendsChecksums(t *testing.T) {
 			"non-compat transfer-manager upload must still send a checksum")
 	})
 }
+
+// A bucket honours the AWS config's request checksum setting on writes, so
+// AWS_REQUEST_CHECKSUM_CALCULATION=when_required keeps the aws-chunked trailer
+// off endpoints that reject it. The SDK sends the trailer only over TLS.
+func TestBucketWriteHonoursRequestChecksumCalculation(t *testing.T) {
+	t.Parallel()
+
+	var captured http.Header
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPut {
+			captured = r.Header.Clone()
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(srv.Close)
+
+	cfg := aws.Config{
+		Region:                     "auto",
+		Credentials:                credentials.NewStaticCredentialsProvider("AKIA-TEST", "secret-test", ""),
+		HTTPClient:                 srv.Client(),
+		RequestChecksumCalculation: aws.RequestChecksumCalculationWhenRequired,
+	}
+	ctx := utils.WithAwsConfig(context.Background(), &cfg)
+
+	bucket, err := createS3Bucket(ctx, &url.URL{Scheme: "s3", Host: "test-bucket"},
+		map[string]string{io.S3EndpointURL: srv.URL})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = bucket.Close() })
+
+	require.NoError(t, bucket.WriteAll(ctx, "test-key", []byte("hello"), nil))
+
+	require.NotNil(t, captured, "no PutObject request captured")
+	assert.Empty(t, captured.Get("X-Amz-Trailer"),
+		"PutObject must not declare a checksum trailer when the config is WhenRequired")
+	assert.NotContains(t, captured.Get("X-Amz-Content-Sha256"), "STREAMING-",
+		"PutObject must use a precomputed payload hash when the config is WhenRequired")
+}
