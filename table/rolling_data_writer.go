@@ -105,14 +105,52 @@ type writerFactory struct {
 	// writer for the same partition from hiding the failed writer's lost rows.
 	streamErrMu sync.Mutex
 	streamErr   error
+
+	// cancelSource is the caller's cancel for the record source, called
+	// once writing fails (see recordWritingArgs.sourceCancel). sourceStop is
+	// the write failure that called it.
+	cancelSource context.CancelFunc
+	sourceStopMu sync.Mutex
+	sourceStop   error
 }
 
 func (w *writerFactory) recordStreamError(err error) {
 	w.streamErrMu.Lock()
-	defer w.streamErrMu.Unlock()
 	if w.streamErr == nil {
 		w.streamErr = err
 	}
+	w.streamErrMu.Unlock()
+	w.stopSource(err)
+}
+
+// stopSource cancels the caller's record source, if it gave one, the first
+// time writing fails, so a reader blocked in the source returns instead of
+// holding up the failed write.
+func (w *writerFactory) stopSource(cause error) {
+	if w.cancelSource == nil {
+		return
+	}
+	w.sourceStopMu.Lock()
+	first := w.sourceStop == nil
+	if first {
+		w.sourceStop = cause
+	}
+	w.sourceStopMu.Unlock()
+	if first {
+		w.cancelSource()
+	}
+}
+
+// writeFailure returns the write failure that stopped the source in place of
+// err, which then only reports the source's cancellation.
+func (w *writerFactory) writeFailure(err error) error {
+	w.sourceStopMu.Lock()
+	defer w.sourceStopMu.Unlock()
+	if w.sourceStop != nil {
+		return w.sourceStop
+	}
+
+	return err
 }
 
 func (w *writerFactory) firstStreamError() error {
@@ -235,6 +273,7 @@ func newWriterFactory(rootLocation string, args recordWritingArgs, meta *Metadat
 		rootURL:          rootURL,
 		fs:               args.fs,
 		writeUUID:        args.writeUUID,
+		cancelSource:     args.sourceCancel,
 		taskSchema:       taskSchema,
 		targetFileSize:   targetFileSize,
 		locProvider:      locProvider,
