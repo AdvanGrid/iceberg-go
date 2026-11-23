@@ -2314,6 +2314,7 @@ type overwriteOperation struct {
 	concurrency   int
 	filter        iceberg.BooleanExpression
 	caseSensitive bool
+	sourceCancel  context.CancelFunc
 }
 
 // OverwriteOption applies options to overwrite operations
@@ -2346,6 +2347,18 @@ func WithOverwriteFilter(filter iceberg.BooleanExpression) OverwriteOption {
 func WithOverwriteCaseInsensitive() OverwriteOption {
 	return func(op *overwriteOperation) {
 		op.caseSensitive = false
+	}
+}
+
+// WithOverwriteSourceCancel gives the overwrite the cancel function of the
+// context the RecordReader reads its source with. The overwrite calls it as
+// soon as writing the records fails. Without it, a failed partitioned write
+// waits for the reader's next record before it returns, and a reader blocked on
+// its own context, for example a throttled database stream, holds the failed
+// overwrite until that context ends.
+func WithOverwriteSourceCancel(cancel context.CancelFunc) OverwriteOption {
+	return func(op *overwriteOperation) {
+		op.sourceCancel = cancel
 	}
 }
 
@@ -2395,10 +2408,11 @@ func (t *Transaction) Overwrite(ctx context.Context, rdr array.RecordReader, sna
 	}
 
 	itr := recordsToDataFiles(ctx, t.tbl.Location(), meta, recordWritingArgs{
-		sc:        rdr.Schema(),
-		itr:       array.IterFromReader(rdr),
-		fs:        wfs,
-		writeUUID: &updater.commitUuid,
+		sc:           rdr.Schema(),
+		itr:          array.IterFromReader(rdr),
+		fs:           wfs,
+		writeUUID:    &updater.commitUuid,
+		sourceCancel: overwrite.sourceCancel,
 	})
 
 	for df, err := range itr {

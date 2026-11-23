@@ -2012,6 +2012,9 @@ type recordWritingArgs struct {
 	// into the newly written DV so a data file that already had a DV ends up
 	// with a single merged vector (the caller removes the superseded one).
 	existingDVs map[string]*dv.RoaringPositionBitmap
+	// sourceCancel, when set, is called as soon as writing fails, so a
+	// source blocked on its own context stops and the write can return.
+	sourceCancel context.CancelFunc
 }
 
 // checkNoUnknownTransform rejects writes against a spec containing an unknown
@@ -2135,7 +2138,7 @@ func unpartitionedWrite(ctx context.Context, factory *writerFactory, records ite
 		writer := factory.newRollingDataWriter(writerCtx, "", nil, outputCh)
 		for rec, err := range records {
 			if err != nil {
-				errCh <- err
+				errCh <- factory.writeFailure(err)
 				close(errCh)
 				writer.abortAndWait()
 

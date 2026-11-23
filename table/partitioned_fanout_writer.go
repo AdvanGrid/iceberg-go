@@ -178,7 +178,12 @@ func (p *partitionedFanoutWriter) Write(ctx context.Context, workers int) iter.S
 	order := newRecordOrder()
 	for range workers {
 		fanoutWorkers.Go(func() error {
-			return p.fanout(fanoutCtx, writerCtx, inputRecordsCh, order, outputDataFilesCh)
+			err := p.fanout(fanoutCtx, writerCtx, inputRecordsCh, order, outputDataFilesCh)
+			if err != nil && fanoutCtx.Err() == nil {
+				p.writerFactory.stopSource(err)
+			}
+
+			return err
 		})
 	}
 
@@ -369,6 +374,9 @@ func yieldDataFiles(
 		defer close(outputDataFilesCh)
 		defer cancel()
 		err := fanoutWorkers.Wait()
+		if err != nil {
+			err = writerFactory.writeFailure(err)
+		}
 		// Wait includes the feeder, which closes inputRecordsCh, so draining cannot
 		// block. Any remaining batches were retained by the feeder but never dequeued;
 		// workers release dequeued batches themselves.
